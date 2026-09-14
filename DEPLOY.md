@@ -169,7 +169,16 @@ mv alinagent.new alinagent
 | `github` | `Alin981010/alin-chat-assistant` | 主仓库 |
 | `origin` | `xiang-wanlin1024/alin-chat-assistant` | Gitee 镜像 |
 
-> **Gitee 侧的仓库名要用网页改**：Gitee v5 API 不接受账号密码（会回
+两个仓库名已于 2026-09 一并改掉（旧地址 `alin-agent` / `AlinAgent` 仍会 302 跳转，
+所以老链接不会失效）。改名后记得同步本地 remote：
+
+```powershell
+git remote set-url origin https://gitee.com/xiang-wanlin1024/alin-chat-assistant.git
+git remote set-url github https://github.com/Alin981010/alin-chat-assistant.git
+git remote -v      # 核对
+```
+
+> **Gitee 改名只能走网页**：Gitee v5 API 不接受账号密码（回
 > `401 Access token does not exist`），必须用私人令牌。网页 10 秒能改完，不值得为它存令牌。
 
 **GitHub 的 git 通道会被网络阻断**（`github.com:443` 连不上，而
