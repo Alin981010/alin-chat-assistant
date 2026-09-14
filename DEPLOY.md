@@ -106,6 +106,46 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 
 **改完 `.env` 记得第 0 节第 1 条。**
 
+### 怎么确认这几项真的生效（别只看 `.env` 写了）
+
+写进 `.env` 不等于生效——环境变量只在容器**创建**时注入，`restart` 不会重读。
+下面几条都能在服务器上直接跑，是各自的验收命令：
+
+```bash
+cd ~/alinagent
+
+# 1) APP_SECRET_KEY：启动日志里不该再出现「未配置」这条 warning
+docker compose logs app 2>&1 | grep -c "APP_SECRET_KEY 未配置"     # 期望 0
+
+# 1b) 换密钥会让旧 cookie 全部作废：伪造签名的 cookie 应被换成全新随机身份
+curl -s --cookie "alinagent_id=abc.def" localhost:8088/api/identity
+
+# 1c) 密钥要能跨重启：同一个 cookie 在 restart 前后应拿到同一个 org
+curl -s -c /tmp/c.txt -o /dev/null localhost:8088/api/identity
+curl -s -b /tmp/c.txt localhost:8088/api/identity        # 记下 org
+docker compose restart app && sleep 20
+curl -s -b /tmp/c.txt localhost:8088/api/identity        # 应该还是同一个 org
+
+# 2) APP_ALLOWED_ORIGINS：白名单内返回该头，陌生来源不返回（浏览器据此拦截）
+curl -s -i -X OPTIONS localhost:8088/api/chat/stream \
+  -H "Origin: http://<你的地址>:8088" -H "Access-Control-Request-Method: POST" \
+  | grep -i access-control-allow-origin                   # 期望有
+curl -s -i localhost:8088/api/config -H "Origin: https://evil.example.com" \
+  | grep -ci access-control-allow-origin                  # 期望 0
+
+# 3) 服务本身
+curl -s localhost:8088/health
+```
+
+> **`APP_COOKIE_SECURE` 只有上了 HTTPS 才能置 true**。置 true 后 cookie 仅在 HTTPS
+> 下发送，而现在用的是 `http://<IP>:8088` 明文访问，改了会导致身份无法保持。
+> 等反向代理加了 TLS、改用 https 访问之后，再同时改这一项。
+
+> **安全组收窄到某个 `/32` 之前，先确认那个 IP 就是你自己**：从服务器上看不出来；
+> 在本地机器上查到的出口 IP 可能是代理/VPN 的地址，填错的结果是陌生人被挡住、
+> 你自己也进不去。稳妥做法是先在控制台加一条新的放行规则、用自己的浏览器实测能通，
+> 再删掉原来的 `0.0.0.0/0`。
+
 ## 6. 切换并启动
 
 ```bash
