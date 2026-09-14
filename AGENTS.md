@@ -84,6 +84,26 @@ token、`max_tokens` 4096、`recursion_limit` 40。全都可以用环境变量�
   改能力清单/代码约定就改 `AGENTS_MEMORY_BASE`。
 - 新增前端可见开关时走 `GET /api/config`（目前有 `code_execution`、`assistant_name`）。
 
+### 11. 行尾：仓库是 LF，工作区可能是 CRLF
+开发机全局 `core.autocrlf=true`，所以**工作区是 CRLF、仓库存 LF**。两个真实后果：
+
+- `git status` 会显示"已修改"而 `git diff` 是空的（纯行尾差异），别被它骗，
+  也别急着提交；
+- **用 GitHub Git Data API 补推文件是按工作区原始字节造 blob 的**，会把 CRLF 写进
+  仓库（实测踩过：`app/routes.py` 变成 1246 行全 CRLF，与其余文件不一致，
+  tree 哈希永远对不上本地）。走 API 推文件前，务必先把内容规范成 LF。
+
+仓库已加 `.gitattributes`（`* text=auto eol=lf`）锁住这件事。
+
+### 12. 前端回归怎么跑（没有 headless Chrome 时）
+`tests/e2e.js` 需要 headless Chrome，受限环境里起不来（进程都不出现）。
+「过期会话自愈」这条路径由 `tests/test_stale_session.js` 覆盖：它用 Node 的 `vm`
+加载**真实的** `static/js/app.js`，只把 DOM 与 fetch 换成桩，验证
+「旧会话 403 → 清本地记录 → 换新身份」以及「正常会话不被误清」。
+
+`app.js` 结尾会立即调 `boot()`（async），断言前要让微任务跑完（见该文件里的
+`runAppSettled`）——否则测到的是"还没开始"。
+
 
 ---
 
