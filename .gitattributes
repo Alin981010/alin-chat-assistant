@@ -1,0 +1,26 @@
+# 统一行尾，避免「工作区与仓库不一致」引发的问题。
+#
+# 背景：开发机（Windows）的全局 git 配置是 core.autocrlf=true，于是工作区是 CRLF、
+# 仓库里存的是 LF。这带来两个真实麻烦：
+#
+#   1. `git status` 时常显示"已修改"但 `git diff` 又是空的（行尾差异），
+#      容易误判改动、也可能把 CRLF 提交进去；
+#   2. 用 GitHub Git Data API 补推文件时，是**按工作区原始字节**造 blob 的，
+#      结果那个文件在仓库里变成 CRLF，与其余文件不一致
+#      （实测踩过：只有 app/routes.py 变成 1246 行全 CRLF）。
+#
+# 这里显式声明：仓库内一律 LF。Windows 检出时是否转 CRLF 由各人本地决定，
+# 但进入仓库的内容永远是 LF。
+* text=auto eol=lf
+
+# 二进制文件不要做行尾转换，否则会损坏
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pptx binary
+*.xlsx binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
