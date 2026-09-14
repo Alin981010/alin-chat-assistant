@@ -153,6 +153,54 @@ mv alinagent.new alinagent
 
 回滚就是把两个目录名换回来，再 `docker compose up -d --no-build`。
 
+> **原地部署也必须留备份。** 若图省事直接把代码解压覆盖 `~/alinagent`（本文档第 3 步
+> 的 `alinagent.new` 就是为了避免这个），请先手动归档：
+> `tar -czf ~/alinagent-deployed-$(date +%Y%m%d).tar.gz --exclude=.env .`
+> 否则一旦新版起不来，既没有旧目录可切换，也没有可回滚的源码。
+
+---
+
+## 9. 推送代码到远端（GitHub / Gitee）
+
+两个远端都在用，名字不同：
+
+| 远端 | 仓库 | 说明 |
+|---|---|---|
+| `github` | `Alin981010/alin-chat-assistant` | 主仓库 |
+| `origin` | `xiang-wanlin1024/alin-chat-assistant` | Gitee 镜像 |
+
+> **Gitee 侧的仓库名要用网页改**：Gitee v5 API 不接受账号密码（会回
+> `401 Access token does not exist`），必须用私人令牌。网页 10 秒能改完，不值得为它存令牌。
+
+**GitHub 的 git 通道会被网络阻断**（`github.com:443` 连不上，而
+`api.github.com:443` 正常）。表现是 `git push github main` 长时间挂起后报
+`Could not connect to server` 或 `Recv failure: Connection was reset`——**这不是配置问题，
+别去改 remote、凭据或代理设置**。
+
+处理顺序：
+
+1. 先 `git push origin main`（Gitee 稳定可达），代码不会丢；
+2. 隔几分钟重试 `git push github main`——实测是间歇性的，恢复了就能正常推；
+3. 仍不通就走 **GitHub Git Data API**（`api.github.com` 可达）：用
+   `POST /git/blobs` → `POST /git/trees` → `POST /git/commit` → `PATCH /git/refs/heads/main`
+   把落后的文件补上去。
+
+### 走 API 时有个 SHA 分叉的坑
+API 造出来的 commit 与本地 commit **内容相同但 SHA 不同**，于是本地历史与远端分叉，
+之后每次 `git push github` 都会被 `non-fast-forward` 拒掉，而且**不能**把远端引用指回
+本地 SHA（那个 git 对象从来没推上去，GitHub 会回 `422 Object does not exist`）。
+
+正确的收尾是**让本地对齐远端**：
+
+```powershell
+git diff --stat <本地HEAD> github/main   # 必须先确认为空（内容一致）
+git fetch github main
+git reset --hard github/main             # 只换 SHA，内容不变
+git push --force-with-lease origin main  # Gitee 一并对齐
+```
+
+`--force-with-lease` 而不是 `--force`：万一远端有别人的提交会拒绝，不会误删。
+
 ---
 
 ## 故障对照表
