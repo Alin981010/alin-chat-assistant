@@ -138,13 +138,25 @@ def _guard_thread_owner(thread_id: str, requested_user: Optional[str] = None) ->
 
     thread_org, thread_user = _parse_thread_owner(thread_id)
     if thread_org is None:
-        raise HTTPException(status_code=403, detail="无法识别的会话标识。")
+        raise HTTPException(
+            status_code=403,
+            detail="无法识别的会话标识。请新建一个会话。",
+        )
     if thread_org != identity.org_id:
         logger.warning(f"会话越权被拒：thread={thread_id}，身份 org={identity.org_id}")
-        raise HTTPException(status_code=403, detail="无权访问该会话。")
+        # 措辞要对**两种情况**都成立：真的拿了别人的 thread_id（越权），
+        # 以及身份改造前的老会话（自己的，但已作废）。对后者说「无权」会让人
+        # 以为账号出了问题，所以把「新建会话」这条出路写清楚。
+        raise HTTPException(
+            status_code=403,
+            detail="该会话不属于当前身份（可能是早期版本的旧会话，已作废）。请新建一个会话继续。",
+        )
     if thread_user is not None and thread_user != expected_user:
         logger.warning(f"会话越权被拒：thread={thread_id}，身份 user={identity.user_id}")
-        raise HTTPException(status_code=403, detail="无权访问该会话。")
+        raise HTTPException(
+            status_code=403,
+            detail="该会话不属于当前身份（可能是早期版本的旧会话，已作废）。请新建一个会话继续。",
+        )
 
 
 def _budget_preflight(request: Request, org_id: str, message: str, extra_chars: int = 0) -> int:

@@ -205,6 +205,22 @@ def test_http() -> None:
     check("读同 org 内别人的会话历史 → 403（未带 user_id 也必须被拦）",
           r.status_code == 403, r.status_code)
 
+    # 身份迁移前的旧会话（org 写死 default-org）：必须 403，但文案要给出出路。
+    # 前端靠这条文案/状态码识别「过期会话」并自动换新会话，改错了用户会卡死。
+    legacy_thread = "default-org__u326862175996__mu1dkj7w"
+    r = c1.get(f"/api/history/{legacy_thread}")
+    check("身份迁移前的旧会话 → 403", r.status_code == 403, r.status_code)
+    check("旧会话的 403 文案指明出路（新建会话）",
+          "新建一个会话" in r.json().get("detail", ""), r.json().get("detail"))
+
+    r = c1.post("/api/chat/stream", json={
+        "message": "你好",
+        "thread_id": legacy_thread,
+        "user_id": id1["user_id"],
+        "org_id": id1["org_id"],
+    })
+    check("往旧会话发消息 → 403（前端据此换新会话重发）", r.status_code == 403, r.status_code)
+
     r = c1.get(f"/api/history/{peer_thread}?user_id={id2['user_id']}")
     check("带别人的 user_id 读会话历史 → 403", r.status_code == 403, r.status_code)
 

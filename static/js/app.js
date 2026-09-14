@@ -273,7 +273,13 @@
     const res = await fetch(path, Object.assign({ headers:{ 'Content-Type':'application/json' } }, opts));
     const data = await res.json().catch(()=> ({}));
     /* FastAPI raises HTTPException -> { detail }, not { error } */
-    if(!res.ok) throw new Error(data.detail || data.error || ('HTTP ' + res.status));
+    if(!res.ok){
+      const err = new Error(data.detail || data.error || ('HTTP ' + res.status));
+      /* 把状态码带上：调用方要靠它区分「过期会话（403，可自愈）」和真失败。
+         只靠文案匹配太脆，措辞一改就失效。 */
+      err.status = res.status;
+      throw err;
+    }
     return data;
   }
 
@@ -329,6 +335,39 @@
     return out;
   }
 
+  /* ============================================================
+     过期会话自愈
+
+     服务端的归属校验会拒掉「不属于当前身份」的会话。最典型的来源不是攻击，
+     而是**身份迁移**：早期版本里 org_id 由前端写死（default-org），后来改成
+     服务端签名，于是浏览器 localStorage 里那些 default-org__ 开头的旧会话
+     在服务端已作废——而 activeThread 是持久化的，刷新后还会去恢复它，
+     表现就是"打开页面就报无权访问、消息也发不出去"。
+
+     这类错误必须被识别并**自动换成新会话**，否则用户会一直卡在错误上。
+     ============================================================ */
+  function isStaleSessionError(err){
+    if(!err) return false;
+    const m = String(err.message || '');
+    return err.status === 403 || /无权访问|不属于当前身份|无法识别的会话标识/.test(m);
+  }
+
+  function dropThreadLocally(id){
+    if(id){
+      state.sessions = (state.sessions || []).filter(x => x.id !== id);
+      forgetThread(id);
+    }
+    state.threadId = null;
+    state.messages = [];
+    saveActive(null);
+  }
+
+  function recoverFromStaleSession(id){
+    dropThreadLocally(id);
+    toastShow('该会话属于旧版本（身份迁移前），已作废；已为你新建会话。');
+    applyBlank();
+  }
+
   async function openSession(id){
     try{
       const data = await api(API.history(id));
@@ -344,6 +383,7 @@
       renderThread();
       renderSessions();
     }catch(e){
+      if(isStaleSessionError(e)){ recoverFromStaleSession(id); return; }
       toastShow(e.message || '加载会话失败', true);
     }
   }
@@ -668,7 +708,28 @@
     }
   }
 
-  async function streamChat(message, attachment){
+  /* 过期的 activeThread 会让**每一条**消息都 403（thread_id 从它拼出来），
+     所以这里自愈：清掉旧会话、新建一个、把这一轮重发一次，而不是把
+     「无权访问」糊在用户脸上让他自己想办法。 */
+  async function streamChat(message, attachment, retried){
+    try{
+      return await streamChatOnce(message, attachment);
+    }catch(err){
+      if(isStaleSessionError(err) && !retried){
+        const staleId = state.threadId;
+        dropThreadLocally(staleId);
+        /* 乐观气泡已经在 streamChatOnce 里落到 DOM 上了，重试前先清掉，
+           否则重发会多出一条重复的用户消息。 */
+        const nodes = stage.querySelectorAll('.thread .msg');
+        for(let i = nodes.length - 1; i >= 0 && i >= nodes.length - 2; i--) nodes[i].remove();
+        toastShow('上次的会话来自旧版本，已作废；已用新会话重新发送。');
+        return await streamChat(message, attachment, true);
+      }
+      throw err;
+    }
+  }
+
+  async function streamChatOnce(message, attachment){
     const threadId = await ensureThread();
     const title = message.replace(/\s+/g, ' ').trim().slice(0, 26) + (message.length > 26 ? '…' : '');
     crumbTitle.textContent = title;
@@ -748,7 +809,9 @@
 
       if(!res.ok || !res.body){
         const detail = await res.json().catch(()=> ({}));
-        throw new Error(detail.detail || detail.error || ('请求失败 HTTP ' + res.status));
+        const err = new Error(detail.detail || detail.error || ('请求失败 HTTP ' + res.status));
+        err.status = res.status;   /* 让上层能识别「过期会话」并自愈 */
+        throw err;
       }
 
       const reader = res.body.getReader();
@@ -791,6 +854,9 @@
       }
       toastShow(err.message || '生成失败', true);
       finalize(true);
+      /* 过期会话交给外层 streamChat 自愈（换新会话重发）。这里必须**重新抛出**，
+         否则 streamChatOnce 一律吞掉错误，自愈路径永远不会被触发。 */
+      if(isStaleSessionError(err)) throw err;
     }finally{
       state.streaming = false;
       sendBtn.classList.remove('sending');
@@ -1183,6 +1249,13 @@
         .map(m => ({ role: m.role, content: m.content || '', reasoning: m.reasoning || null }));
     }catch(e){
       state.messages = [];
+      /* 身份迁移后的旧会话：直接丢掉本地记录并提示一次，别让它每轮开屏都来一次 403。
+         其他错误保持原样静默——恢复失败不算致命。 */
+      if(isStaleSessionError(e)){
+        dropThreadLocally(id);
+        toastShow('上次的会话来自旧版本，已作废；已为你新建会话。');
+        return false;
+      }
     }
     if(!state.messages.length){ state.threadId = null; saveActive(null); return false; }
     rememberThread(id, state.messages.length);
