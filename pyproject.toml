@@ -1,0 +1,32 @@
+[project]
+name = "alinagent"
+version = "0.1.0"
+description = "阿林助手 · AlinAgent —— 带代码沙箱的检索增强对话服务"
+authors = [
+    { name = "阿林", email = "1024663398@qq.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "deepagents>=0.7.13",
+    "deepagents-opensandbox>=1.0.2",
+    "fastapi>=0.141.1",
+    "langchain-deepseek>=1.1.0",
+    "langgraph-checkpoint-postgres>=3.1.2",
+    "opensandbox>=0.1.16",
+    "psycopg[binary,pool]>=3.3.5",
+    "python-dotenv>=1.2.3",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.52.4",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[dependency-groups]
+dev = [
+    "python-pptx>=1.0.2",
+]
+
+
+

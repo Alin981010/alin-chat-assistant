@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="color-scheme" content="light" />
+<meta name="description" content="阿林助手（AlinAgent）—— 会思考、能上手的对话助手，可以在沙箱里真跑代码。" />
+<title>阿林助手 · AlinAgent</title>
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cg fill='%23C63A2B'%3E%3Ccircle cx='24' cy='24' r='9'/%3E%3Cellipse cx='24' cy='10' rx='6' ry='8'/%3E%3Cellipse cx='24' cy='38' rx='6' ry='8'/%3E%3Cellipse cx='10' cy='24' rx='8' ry='6'/%3E%3Cellipse cx='38' cy='24' rx='8' ry='6'/%3E%3Cellipse cx='14' cy='14' rx='6' ry='6' transform='rotate(-45 14 14)'/%3E%3Cellipse cx='34' cy='34' rx='6' ry='6' transform='rotate(-45 34 34)'/%3E%3Cellipse cx='34' cy='14' rx='6' ry='6' transform='rotate(45 34 14)'/%3E%3Cellipse cx='14' cy='34' rx='6' ry='6' transform='rotate(45 14 34)'/%3E%3C/g%3E%3Ccircle cx='24' cy='24' r='7' fill='%23FBF4E6'/%3E%3C/svg%3E" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700;9..144,800;9..144,900&family=Noto+Serif+SC:wght@400;500;600;700;900&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+<link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+
+<!-- ===== cut-paper symbol sheet (masks are referenced from the CSS) ===== -->
+<svg class="paper-svg" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="cut-edge" x="-6%" y="-6%" width="112%" height="112%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.045 0.05" numOctaves="3" seed="7" result="n" />
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="4.2" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+    <filter id="cut-sheet" x="-3%" y="-3%" width="106%" height="106%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.03 0.035" numOctaves="3" seed="3" result="n" />
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="3.4" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </defs>
+</svg>
+
+<!-- ===== cut-paper backdrop: distant hills, sun, clouds ===== -->
+<div class="gl" id="gl" aria-hidden="true">
+  <span class="sc-3"></span>
+  <span class="sc-1"></span>
+  <span class="sc-2"></span>
+  <span class="pl pl-1"></span>
+  <span class="pl pl-2"></span>
+  <span class="pl pl-3"></span>
+</div>
+
+<!-- ===== paper texture layers ===== -->
+<div class="grain" aria-hidden="true"></div>
+<div class="scanlines" aria-hidden="true"></div>
+<div class="vignette" aria-hidden="true"></div>
+
+<!-- ===== edge cut-paper band ===== -->
+<div class="edge-marquee" aria-hidden="true">
+  <div class="edge-track">
+    <span>ALINAGENT · 阿林助手 · DIALOGUE · SANDBOX · </span>
+    <span>ALINAGENT · 阿林助手 · DIALOGUE · SANDBOX · </span>
+  </div>
+</div>
+
+<!-- ===== scrapbook margin pieces ===== -->
+<div class="scrapbook" aria-hidden="true">
+  <span class="scrap scrap-red"></span>
+  <span class="scrap scrap-jade"></span>
+  <span class="leaf leaf-1"></span>
+  <span class="leaf leaf-2"></span>
+  <span class="leaf leaf-3"></span>
+</div>
+
+<div class="app">
+  <!-- ===================== RAIL ===================== -->
+  <aside class="rail" id="rail" aria-label="会话与文件">
+    <button class="rail-close" id="railClose" type="button" aria-label="收起侧栏"><span data-icon="x"></span></button>
+
+    <header class="rail-head">
+      <div class="brand">
+        <div class="brand-glyph"><i data-icon="hexagon"></i></div>
+        <div class="brand-word">
+          <span class="name" id="wordmark" data-scramble="阿林助手">阿林助手</span>
+          <span class="tag">AlinAgent</span>
+        </div>
+      </div>
+      <button class="new-btn" id="newBtn" type="button"><i data-icon="plus"></i><span>新会话</span></button>
+    </header>
+
+    <div class="rail-label"><span>Index</span><span class="count" id="sessionCount"></span></div>
+
+    <nav class="session-list" id="sessionList" aria-label="会话历史"></nav>
+
+    <div class="rail-foot">
+      <span class="ver">v0.1.0 · 剪纸</span>
+      <span class="sync" id="engineState"><span class="dot"></span>连接中…</span>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ===================== MAIN ===================== -->
+  <main class="main">
+    <header class="topbar">
+      <button class="menu-btn" id="menuBtn" type="button" aria-label="打开侧栏"><i data-icon="panel-left"></i></button>
+      <div class="crumb">
+        <span class="t" id="crumbTitle">选择一个会话</span>
+        <span class="s" id="crumbMeta">ALINAGENT · DIALOGUE ENGINE</span>
+      </div>
+      <div class="top-right">
+        <div class="model-pill"><span class="pulse"></span>ALINAGENT</div>
+        <button class="top-icon" id="newTop" type="button" aria-label="新对话"><i data-icon="square-pen"></i></button>
+      </div>
+    </header>
+
+    <section class="stage" id="stage" aria-live="polite">
+      <div class="ghost-word" aria-hidden="true"><span>R</span><span>A</span><span>G</span></div>
+      <!-- hero / thread injected by JS -->
+    </section>
+
+    <footer class="composer-wrap">
+      <div class="attach-bar" id="attachBar">
+        <button class="attach-add" id="uploadBtn" type="button" aria-label="上传文件">
+          <i data-icon="paperclip"></i><span>上传文件</span>
+        </button>
+        <span class="attach-count" id="kbCount">0 个文件</span>
+        <span class="attach-list" id="attachList"></span>
+        <input type="file" id="fileInput" accept=".pdf,.docx,.xlsx,.xlsm,.md,.markdown,.txt,.text,.log,.csv,.tsv,.json,.jsonl,.ndjson" multiple hidden />
+      </div>
+      <div class="composer" id="composer">
+        <span class="prompt-char" aria-hidden="true">/</span>
+        <textarea id="input" rows="1" placeholder="说点什么，回车发送…" aria-label="输入问题"></textarea>
+        <button class="send idle" id="send" type="button" aria-label="发送"><i data-icon="arrow-up"></i></button>
+      </div>
+      <div class="composer-meta">
+        <span class="kbd"><span class="k">Enter</span>发送<span class="gap"></span><span class="k">Shift + Enter</span>换行</span>
+        <span id="charCount">0</span>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="assertive"><i data-icon="info"></i><span id="toastMsg"></span></div>
+
+<!-- ===================== UPLOAD MODAL (UI only) ===================== -->
+<div class="modal-overlay" id="uploadModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="上传文件">
+    <header class="modal-head">
+      <div class="modal-title">
+        <div class="modal-ic"><i data-icon="library"></i></div>
+        <div>
+          <h2>上传文件</h2>
+          <p>解析后作为附件，随下一轮提问一起发送</p>
+        </div>
+      </div>
+      <button class="modal-close" id="uploadClose" type="button" aria-label="关闭"><i data-icon="x"></i></button>
+    </header>
+
+    <div class="modal-body">
+      <div class="dropzone" id="dropzone">
+        <div class="dz-glyph"><i data-icon="cloud-upload"></i></div>
+        <div class="dz-title">拖拽文件到这里</div>
+        <div class="dz-sub">或点击选择文件</div>
+        <button class="dz-btn" id="dropBtn" type="button"><i data-icon="folder-open"></i>选择文件</button>
+        <div class="dz-formats"><span>PDF</span><span>DOCX</span><span>XLSX</span><span>CSV</span><span>MD</span><span>TXT</span></div>
+      </div>
+      <div class="file-list" id="fileList"></div>
+    </div>
+
+    <footer class="modal-foot">
+      <div class="modal-note"><i data-icon="info"></i><span id="fileHint">支持 PDF / DOCX / XLSX / CSV / MD / TXT</span></div>
+      <button class="modal-primary" id="uploadGo" type="button" disabled><i data-icon="rocket"></i>开始上传<span class="n" id="uploadCount">0</span></button>
+    </footer>
+  </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

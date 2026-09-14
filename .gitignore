@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.idea/
+.vscode/
+.jbeval/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# tests/ 跑出来的临时产物
+tests/sample.csv
+tests/live.csv
+tests/shot-*.png
+tests/out/
+skills/**/__pycache__/
