@@ -30,6 +30,7 @@ requires-dist = [
     { name = "deepagents", specifier = ">=0.7.13" },
     { name = "deepagents-opensandbox", specifier = ">=1.0.2" },
     { name = "fastapi", specifier = ">=0.141.1" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "langchain-deepseek", specifier = ">=1.1.0" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.1.2" },
     { name = "opensandbox", specifier = ">=0.1.16" },
