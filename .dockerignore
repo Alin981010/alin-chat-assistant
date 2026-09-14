@@ -1,0 +1,42 @@
+# 构建上下文瘦身 + 防止密钥进镜像层。
+# 注意：千万不能把 .env 放进去。镜像层是永久的，删掉文件也不会让它从历史里消失。
+
+# ---- 密钥 ----
+.env
+.env.*
+!.env.example
+
+# ---- 本地虚拟环境 / 编辑器 / 评测产物 ----
+.venv/
+venv/
+.git/
+.gitignore
+.idea/
+.vscode/
+.jbeval/
+
+# ---- Python 缓存与打包产物 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# ---- tests/ 跑出来的临时产物（tests/ 本身保留，便于进容器后跑验证脚本）----
+tests/out/
+tests/sample.csv
+tests/live.csv
+tests/shot-*.png
+
+# ---- Docker 自身：镜像里不需要 ----
+Dockerfile
+Dockerfile.*
+.dockerignore
+docker-compose*.yml
+docker-compose*.yaml
+
+# ---- 杂项 ----
+*.log
+.DS_Store
+Thumbs.db

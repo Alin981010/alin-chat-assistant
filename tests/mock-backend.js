@@ -12,9 +12,13 @@ const PORT = Number(process.env.PORT || 8099);
 const allRequests = [];
 const uploadedFiles = new Map();
 
+/* 身份由后端签发：真实后端用签名 cookie（app/identity.py），这里固定一组即可，
+   前端启动时会 GET /api/identity 取回，thread_id 依赖它。 */
+const MOCK_IDENTITY = { org_id: 'omock0000000000000000abcd', user_id: 'umock0000000000000000abcd' };
+
 const THREADS = [
-  { thread_id: 'default-org__u-test__aaaa1111', created_at: null, last_message: '你能做什么？' },
-  { thread_id: 'default-org__u-test__bbbb2222', created_at: null, last_message: '总结最近的核心观点' }
+  { thread_id: MOCK_IDENTITY.org_id + '__' + MOCK_IDENTITY.user_id + '__aaaa1111', created_at: null, last_message: '你能做什么？' },
+  { thread_id: MOCK_IDENTITY.org_id + '__' + MOCK_IDENTITY.user_id + '__bbbb2222', created_at: null, last_message: '总结最近的核心观点' }
 ];
 
 const MIME = {
@@ -86,9 +90,18 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/__log') return json(res, 200, { requests: allRequests });
     if (u.pathname === '/__reset') { allRequests.length = 0; return json(res, 200, { ok: true }); }
 
+    if (u.pathname === '/api/identity') return json(res, 200, MOCK_IDENTITY);
+
+    /* 额度：后端真实实现按签名身份计量 token，这里只回一个固定快照，
+       让前端的「今日额度」进度条有数据可渲染。 */
+    if (u.pathname === '/api/usage') return json(res, 200, {
+      day: '2026-01-01', tokens_used: 123456, tokens_budget: 2000000,
+      requests_today: 7, requests_per_min_limit: 8
+    });
+
     if (u.pathname === '/api/threads' && req.method === 'GET') {
       const uid = u.searchParams.get('user_id');
-      const scoped = uid ? THREADS.map(t => Object.assign({}, t, { thread_id: t.thread_id.replace('u-test', uid) })) : [];
+      const scoped = uid ? THREADS.map(t => Object.assign({}, t, { thread_id: t.thread_id.replace(MOCK_IDENTITY.user_id, uid) })) : [];
       return json(res, 200, scoped);
     }
     if (u.pathname.startsWith('/api/threads/') && req.method === 'DELETE') return json(res, 200, { status: 'ok' });

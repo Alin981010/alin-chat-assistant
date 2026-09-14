@@ -17,3 +17,8 @@ tests/live.csv
 tests/shot-*.png
 tests/out/
 skills/**/__pycache__/
+
+# DSH 本地指令 overlay：含服务器地址、密钥路径等运行环境信息。
+# 本仓库是公开的，这些东西不能提交。AGENTS.md 本身可以提交（已剔除敏感信息）。
+AGENTS.local.md
+CLAUDE.local.md

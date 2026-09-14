@@ -1,7 +1,7 @@
 [project]
-name = "alinagent"
+name = "alin-chat-assistant"
 version = "0.1.0"
-description = "阿林助手 · AlinAgent —— 带代码沙箱的检索增强对话服务"
+description = "阿林对话助手 · Alin Chat Assistant —— 问答 / 写作 / 编程 / 分析，一个对话框搞定"
 authors = [
     { name = "阿林", email = "1024663398@qq.com" }
 ]
@@ -10,6 +10,7 @@ dependencies = [
     "deepagents>=0.7.13",
     "deepagents-opensandbox>=1.0.2",
     "fastapi>=0.141.1",
+    "httpx>=0.28",                 # tools/general_tools.py 的天气查询直接用
     "langchain-deepseek>=1.1.0",
     "langgraph-checkpoint-postgres>=3.1.2",
     "opensandbox>=0.1.16",

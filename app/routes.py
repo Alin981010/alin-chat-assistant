@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import re
+import threading
+import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -13,7 +15,27 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
 
 from .agent_setup import _ensure_user_habits
+from .budget import (
+    BudgetExceeded,
+    TokenBudget,
+    client_ip,
+    estimate_tokens,
+    extract_tokens_from_chunk,
+    get_budget,
+)
+from .config import (
+    AGENT_RECURSION_LIMIT,
+    ASSISTANT_NAME,
+    ENABLE_CODE_EXECUTION,
+    EXECUTE_RPM_PER_ORG,
+    EXECUTE_TIMEOUT_MAX,
+)
 from .context_type import MemoryContext
+from .identity import (
+    get_current_identity,
+    is_legacy_org,
+    is_valid_id,
+)
 from .models import (
     MessageItem, ChatHistoryResponse, ThreadInfo,
     FileAnalysisResponse,
@@ -37,11 +59,240 @@ _file_org_map: Dict[str, str] = {}
 _file_content_cache: Dict[str, bytes] = {}
 
 
+# ---------------------------------------------------------------------------
+# 身份与授权
+#
+# org_id 决定用哪个沙箱容器、能下载哪个容器里的文件，是授权键。
+# 它不再直接采信请求体里的值，而是必须与中间件校验过的签名身份一致
+# （见 app/identity.py 的模块文档）。所有涉及「谁的沙箱」的入口都先过
+# _resolve_org()，越权一律 403。
+# ---------------------------------------------------------------------------
+
+#: 沙箱内允许用户下载文件的根目录。用户上传的文件落在这里
+#: （_sync_upload_file 拼 /workspace/{file_id}_{filename}），
+#: skill 脚本与产物也都在 /workspace 下。
+SANDBOX_DOWNLOAD_ROOT = "/workspace"
+
+#: execute 的硬上限（秒）与每 org 每分钟次数，统一从 config 读（可用环境变量覆盖）。
+#: 前端默认请求 60，允许调大但有天花板，否则一个用户能把容器占死。
+EXECUTE_TIMEOUT_DEFAULT = 60
+
+
+def _resolve_org(requested: Optional[str]) -> str:
+    """把请求声明的 org_id 与已校验身份比对，返回可信的 org_id。
+
+    请求没带 org_id 时回落到身份里的值（兼容老前端）；带了但不一致就是
+    拿别人的授权键来用，直接 403。
+    """
+    identity = get_current_identity()
+    if identity is None:
+        # 正常不会发生：中间件给每个请求都挂了身份。走到这里说明身份中间件
+        # 未生效（例如路由被单独挂载），此时拒绝服务比放行安全。
+        logger.error("identity missing on request; refusing to resolve org")
+        raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
+
+    if is_legacy_org(requested) or not requested:
+        return identity.org_id
+
+    if requested != identity.org_id:
+        logger.warning(
+            f"org 越权被拒：请求声明 org={requested}，实际身份 org={identity.org_id}"
+        )
+        raise HTTPException(status_code=403, detail="无权访问该组织的工作区。")
+
+    return identity.org_id
+
+
+def _resolve_user(requested: Optional[str]) -> str:
+    """解析 user_id：与身份一致才采信，否则回落到身份里的值。
+
+    与 org 不同，user_id 只是会话/记忆的命名空间，不决定容器。声明一个
+    不匹配的值没有越权收益，但会导致后续按 user 过滤的查询取到别人的数据，
+    所以这里不报错、直接忽略，保证行为可预期。
+    """
+    identity = get_current_identity()
+    if identity is None:
+        raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
+    if requested and requested == identity.user_id:
+        return requested
+    if requested and is_valid_id(requested) and requested != identity.user_id:
+        logger.info("user_id 与身份不一致，已忽略请求值，改用身份内的 user_id。")
+    return identity.user_id
+
+
+def _guard_thread_owner(thread_id: str, requested_user: Optional[str] = None) -> None:
+    """校验 thread_id 是否属于当前身份。
+
+    thread_id 形如 ``org__user__后缀``（见 static/js/app.js 的约定与
+    _parse_thread_owner）。**只比 org 是不够的**：同一个容器（org）里的不同
+    用户，会话表在 checkpointer 里是分开的，但光看 org 就能互相读到。
+
+    ``requested_user`` 为空时，一律以身份里的 user_id 为准，而不是「跳过
+    比对」——否则调用方只要省略这个参数就能越过同 org 的会话隔离。
+    """
+    identity = get_current_identity()
+    if identity is None:
+        raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
+
+    expected_user = requested_user or identity.user_id
+
+    thread_org, thread_user = _parse_thread_owner(thread_id)
+    if thread_org is None:
+        raise HTTPException(status_code=403, detail="无法识别的会话标识。")
+    if thread_org != identity.org_id:
+        logger.warning(f"会话越权被拒：thread={thread_id}，身份 org={identity.org_id}")
+        raise HTTPException(status_code=403, detail="无权访问该会话。")
+    if thread_user is not None and thread_user != expected_user:
+        logger.warning(f"会话越权被拒：thread={thread_id}，身份 user={identity.user_id}")
+        raise HTTPException(status_code=403, detail="无权访问该会话。")
+
+
+def _budget_preflight(request: Request, org_id: str, message: str, extra_chars: int = 0) -> int:
+    """对话前的额度/频率检查；超限抛 429（带 Retry-After）。
+
+    必须在**进入 agent 之前**调用：一旦开始 streaming，HTTP 状态码已经发出去了，
+    只能用 SSE 事件表达错误——那是兜底，不是主闸门。
+    """
+    try:
+        return get_budget().check_preflight(
+            org_id=org_id,
+            ip=client_ip(request),
+            message=message,
+            extra_chars=extra_chars,
+        )
+    except BudgetExceeded as e:
+        logger.warning(f"对话被限流拒绝：org={org_id}, code={e.code}, {e.message}")
+        raise HTTPException(
+            status_code=429,
+            detail=e.message,
+            headers={"Retry-After": str(e.retry_after)},
+        )
+
+
+def _safe_download_path(path: str) -> Optional[str]:
+    """校验沙箱下载路径，返回规范化后的路径；不合法返回 ``None``。
+
+    必须落在 /workspace 下、是绝对路径、且不含 ``..``。这一层挡的是
+    「把 path 当任意文件读取接口用」——之前 path 直接透传给沙箱的
+    read_bytes，path=/etc/passwd 就能把容器里的任意文件读出来。
+    """
+    if not path or not isinstance(path, str):
+        return None
+    if "\x00" in path:
+        return None
+
+    candidate = path.strip()
+    if not candidate.startswith("/"):
+        return None
+
+    # 先做纯字符串层面的规范化，避免 ".." 组合绕过前缀判断。
+    parts: List[str] = []
+    for segment in candidate.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            return None
+        parts.append(segment)
+    normalized = "/" + "/".join(parts)
+
+    root = SANDBOX_DOWNLOAD_ROOT.rstrip("/")
+    if normalized != root and not normalized.startswith(root + "/"):
+        return None
+    return normalized
+
+
+_execute_hits: Dict[str, List[float]] = {}
+_execute_hits_lock = threading.Lock()
+EXECUTE_RATE_WINDOW = 60.0
+
+
+def _check_execute_rate(org_id: str) -> None:
+    """沙箱 execute 的按 org 滑动窗口限流；超限抛 429。
+
+    与对话额度分开计：这里限的是「容器被占用的次数」，与 token 无关。
+    真正的成本上限是单次时长（EXECUTE_TIMEOUT_MAX，来自 config）。
+    """
+    now = time.time()
+    with _execute_hits_lock:
+        hits = _execute_hits.setdefault(org_id, [])
+        cutoff = now - EXECUTE_RATE_WINDOW
+        hits[:] = [t for t in hits if t > cutoff]
+        if EXECUTE_RPM_PER_ORG > 0 and len(hits) >= EXECUTE_RPM_PER_ORG:
+            retry_after = max(1, int(hits[0] + EXECUTE_RATE_WINDOW - now))
+            raise HTTPException(
+                status_code=429,
+                detail=f"执行过于频繁，请 {retry_after} 秒后重试。",
+                headers={"Retry-After": str(retry_after)},
+            )
+        hits.append(now)
+
+
 def set_globals(store: PostgresStore, checkpointer: PostgresSaver, agent: Any):
     global _store, _checkpointer, _agent
     _store = store
     _checkpointer = checkpointer
     _agent = agent
+
+    # 把用量计数挂到 LangGraph 的 PostgresStore 上，让每日额度**重启不清零**。
+    # 不挂也能跑，只是刷满额度后重启服务就能重置——那等于没限。
+    try:
+        _attach_budget_store(store)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"用量计数落库未启用（仅内存限流，重启会清零）：{e}")
+
+
+BUDGET_NAMESPACE = ("usage_budget",)
+BUDGET_INDEX_KEY = "/orgs.json"
+
+
+def _budget_store_key(org_id: str) -> str:
+    """每个 org 一条记录。
+
+    不共用一个 key：把不同 org 的用量写在同一条记录上会让「谁用了多少」变成
+    竞争写入，任一 org 的更新都要覆写别人的数据。
+    """
+    return f"/usage_{org_id}.json"
+
+
+def _attach_budget_store(store: Any) -> None:
+    """把预算计数接到 PostgresStore，并在启动时把当天用量读回来。
+
+    为什么值得做：不落库的话，刷满每日额度后**重启服务就能重置**，等于没限。
+
+    记录分两类：``/orgs.json`` 是活跃 org 的索引（否则重启后不知道该读谁），
+    每个 org 一条 ``/usage_<org>.json``。写失败不影响对话——``TokenBudget``
+    内部吞掉异常，只是那一笔丢失。
+    """
+    known_orgs: List[str] = []
+
+    def persist(key: str, day: str, tokens: int, requests: int) -> None:
+        store.put(
+            BUDGET_NAMESPACE,
+            _budget_store_key(key),
+            {"key": key, "day": day, "tokens": tokens, "requests": requests},
+        )
+        if key not in known_orgs:
+            known_orgs.append(key)
+            store.put(BUDGET_NAMESPACE, BUDGET_INDEX_KEY, {"orgs": known_orgs})
+
+    budget = get_budget()
+    budget.attach_store(persist)
+
+    index = store.get(BUDGET_NAMESPACE, BUDGET_INDEX_KEY)
+    index_value = getattr(index, "value", None) if index else None
+    restored = 0
+    if isinstance(index_value, dict):
+        for org_id in index_value.get("orgs") or []:
+            if not isinstance(org_id, str):
+                continue
+            known_orgs.append(org_id)
+            record = store.get(BUDGET_NAMESPACE, _budget_store_key(org_id))
+            value = getattr(record, "value", None) if record else None
+            if isinstance(value, dict) and budget.restore(
+                org_id, value.get("day"), value.get("tokens", 0), value.get("requests", 0)
+            ):
+                restored += 1
+    logger.info(f"用量计数已落库：恢复 {restored} 个 org 的当天用量，额度重启不清零。")
 
 
 def _extract_reasoning_and_content(message: Any) -> Tuple[str, Optional[str]]:
@@ -111,6 +362,15 @@ def _get_messages_from_state(state: Dict[str, Any]) -> List[MessageItem]:
 
 
 def _build_env_footer(org_id: str) -> str:
+    """消息尾部的运行环境说明。
+
+    只在开启代码执行时才有意义：那时模型需要 ``org_id`` 去拼沙箱下载链接
+    （``/api/sandbox/download?org_id=…&path=…``）、需要知道 ``/workspace`` 与
+    ``/skills/`` 的存在。对话模式下这些路径都用不到，写进去只会让模型以为
+    自己有一个沙箱，还可能把 org_id 当"内部信息"泄露给用户。
+    """
+    if not ENABLE_CODE_EXECUTION:
+        return ""
     return (
         f"\n\n【运行环境】org_id={org_id}；沙箱工作目录 /workspace；"
         f"技能目录 /skills/。"
@@ -282,19 +542,28 @@ def _prepare_message_context(message: str, file_id: Optional[str], org_id: str) 
 
         file_org_id = _file_org_map.get(file_id, org_id)
         if file_org_id != org_id:
+            # 以前这里只记一条 warning 然后「用文件所属 org 继续」——等于任何
+            # 用户只要猜到一个别人的 file_id 就能借它读到该 org 沙箱里的文件，
+            # 并且把自己的消息写进别人的容器上下文。file_id 是
+            # f"file_{time:.0f}" 这种可枚举的值，不能当授权凭据用。
             logger.warning(
-                f"File org mismatch: file_id={file_id} was uploaded to "
-                f"org={file_org_id} but current request org={org_id}. "
-                f"Using file's org for sandbox access."
+                f"拒绝跨 org 的文件访问：file_id={file_id} 属于 org={file_org_id}，"
+                f"当前请求 org={org_id}"
             )
+            raise HTTPException(status_code=403, detail="无权访问该文件。")
 
         _set_current_org(file_org_id)
         org_backend = _get_org_backend(file_org_id)
         execution_org = file_org_id
 
+        # 只有真的开着代码执行、且拿到了容器，才把「路径 + 跑脚本」的流程告诉
+        # 模型。否则 execute 工具已被摘掉（见 agent_setup._code_execution_middleware），
+        # 这段提示会让模型答应一件做不到的事：让用户等一个不会出现的分析结果。
+        can_execute = ENABLE_CODE_EXECUTION and org_backend is not None
+
         if parsed.is_small and parsed.full_content:
             file_context = f"\n\n【已上传文件内容】\n{parsed.full_content}\n\n请基于以上文件内容回答问题。"
-        elif org_backend is not None:
+        elif can_execute:
             sandbox_filename = f"{file_id}_{parsed.filename}"
             sandbox_path = f"/workspace/{sandbox_filename}"
             cached_content = _file_content_cache.get(file_id)
@@ -338,7 +607,9 @@ def _prepare_message_context(message: str, file_id: Optional[str], org_id: str) 
                 f"文件名: {parsed.filename}\n"
                 f"行数: {parsed.row_count}\n"
                 f"列名: {parsed.columns}\n"
-                f"由于文件较大且沙箱不可用，只能提供预览数据。\n\n"
+                f"由于文件较大、当前又没有代码执行能力，只能提供预览数据。\n"
+                f"请基于预览回答问题；如果问题必须看全量数据，如实说明这一点，"
+                f"并建议用户缩小数据范围或把关键片段贴进对话。\n\n"
                 f"【文件预览】\n{parsed.preview}"
             )
     else:
@@ -530,11 +801,20 @@ def _stream_sse(
     file_id: Optional[str] = None,
 ) -> Iterator[str]:
     """同步生成器：直接调用 DeepAgents/LangGraph 原生的 graph.stream()，
-    逐个产出 SSE 事件字符串。由 Starlette StreamingResponse 在线程池中迭代。"""
+    逐个产出 SSE 事件字符串。由 Starlette StreamingResponse 在线程池中迭代。
+
+    token 记账在这里做：每次模型调用后累加 ``usage_metadata``，并在**下一轮
+    模型调用之前**检查当日额度是否已耗尽——一轮问答里 agent 可能调用模型
+    很多次（工具循环），只在一头一尾检查的话，中间能烧掉的量无法预估。
+    """
     reasoning_parts: List[str] = []
     content_parts: List[str] = []
     seen_tools = set()
     pending_events: List[str] = []
+    budget = get_budget()
+    reported_tokens = 0
+    tokens_at_last_call = 0
+    truncated_for_budget = False
 
     def on_reasoning(text: str):
         reasoning_parts.append(text)
@@ -563,7 +843,12 @@ def _stream_sse(
             f"Streaming chat: thread_id={thread_id}, org_id={org_id}, "
             f"file_id={file_id}, sandbox_org={_get_current_org()}"
         )
-        config = RunnableConfig(configurable={"thread_id": thread_id})
+        config = RunnableConfig(
+            configurable={"thread_id": thread_id},
+            # 不设的话走 DeepAgents 默认的 9999（deepagents/graph.py），
+            # 工具一旦打转，一次提问就能烧掉几百次模型调用。
+            recursion_limit=AGENT_RECURSION_LIMIT,
+        )
         context = MemoryContext(user_id=user_id, org_id=org_id)
 
         for mode, data in _agent.stream(
@@ -582,6 +867,13 @@ def _stream_sse(
 
             # mode == "messages": (chunk, metadata)
             chunk, _meta = data
+
+            # 每轮都先记账：usage 是累计值，用 max 保证单调
+            reported = extract_tokens_from_chunk(chunk)
+            if reported > tokens_at_last_call:
+                budget.add_tokens(org_id, reported - tokens_at_last_call)
+                tokens_at_last_call = reported
+
             if isinstance(chunk, ToolMessage):
                 output = _coerce_text(chunk.content).strip()
                 if output:
@@ -605,6 +897,13 @@ def _stream_sse(
                 splitter.push(text)
                 for ev in drain():
                     yield ev
+
+            # 额度用尽就停在这里，不再发起下一轮模型调用。
+            # 已经吐出去的内容保留（用户看得到、也不重复计费），只是这一轮
+            # 的答案会不完整——比放任它继续烧下去强。
+            if budget.exceeded_midway(org_id):
+                truncated_for_budget = True
+                break
     except Exception as e:
         logger.error(f"Streaming chat error: thread_id={thread_id}: {e}", exc_info=True)
         yield _sse("error", {"message": str(e)})
@@ -616,10 +915,29 @@ def _stream_sse(
     for ev in drain():
         yield ev
 
+    # 在真实 usage 之外补一笔估算：部分集成在流式下不返回 usage，
+    # 只靠真实值会让「不报用量的供应商」完全绕过额度。
+    if tokens_at_last_call == 0:
+        estimated = estimate_tokens("".join(content_parts)) + estimate_tokens("".join(reasoning_parts))
+        budget.add_tokens(org_id, estimated)
+        reported_tokens = estimated
+    else:
+        reported_tokens = tokens_at_last_call
+
     full_content = "".join(content_parts).strip()
     full_reasoning = "\n\n".join(p for p in reasoning_parts if p.strip()).strip() or None
+
+    if truncated_for_budget:
+        logger.warning(f"因额度耗尽中断生成：thread_id={thread_id}, org={org_id}")
+        yield _sse("budget", {
+            "message": "今日额度已用完，本轮回答被截断。请明天再试。",
+            "tokens_used": budget.snapshot(org_id)["tokens_used"],
+            "tokens_budget": budget.snapshot(org_id)["tokens_budget"],
+        })
+
     logger.info(
-        f"Streaming chat completed: thread_id={thread_id}, reply_length={len(full_content)}"
+        f"Streaming chat completed: thread_id={thread_id}, reply_length={len(full_content)}, "
+        f"tokens≈{reported_tokens}"
     )
     yield _sse("done", {"reply": full_content, "reasoning": full_reasoning})
 
@@ -633,8 +951,10 @@ async def chat(request: Request):
         data = json.loads(body) if body else {}
         message = data.get("message", "")
         thread_id = data.get("thread_id", "default-thread")
-        user_id = data.get("user_id", "local-user")
-        org_id = data.get("org_id", "default-org")
+        org_id = _resolve_org(data.get("org_id"))
+        user_id = _resolve_user(data.get("user_id"))
+        _guard_thread_owner(thread_id, user_id)
+        _budget_preflight(request, org_id, message)
 
         result = await asyncio.wait_for(
             asyncio.to_thread(_sync_chat, message, thread_id, user_id, org_id),
@@ -656,10 +976,11 @@ async def chat(request: Request):
 
 
 @router.post("/files/upload", response_model=FileAnalysisResponse)
-async def upload_file(file: UploadFile = File(...), org_id: str = Form("default-org")):
+async def upload_file(file: UploadFile = File(...), org_id: str = Form("")):
     if not _agent:
         raise HTTPException(status_code=500, detail="Agent not initialized")
     try:
+        org_id = _resolve_org(org_id or None)
         content = await file.read()
         file_id = f"file_{asyncio.get_event_loop().time():.0f}"
 
@@ -670,6 +991,8 @@ async def upload_file(file: UploadFile = File(...), org_id: str = Form("default-
         return result
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="文件处理超时")
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -687,9 +1010,11 @@ async def chat_with_file(request: Request):
         data = json.loads(body) if body else {}
         message = data.get("message", "")
         thread_id = data.get("thread_id", "default-thread")
-        user_id = data.get("user_id", "local-user")
-        org_id = data.get("org_id", "default-org")
+        org_id = _resolve_org(data.get("org_id"))
+        user_id = _resolve_user(data.get("user_id"))
         file_id = data.get("file_id")
+        _guard_thread_owner(thread_id, user_id)
+        _budget_preflight(request, org_id, message)
 
         result = await asyncio.wait_for(
             asyncio.to_thread(_sync_chat_with_file, message, thread_id, user_id, org_id, file_id),
@@ -726,10 +1051,12 @@ async def chat_stream(request: Request):
     data = json.loads(body) if body else {}
     message = data.get("message", "")
     thread_id = data.get("thread_id", "default-thread")
-    user_id = data.get("user_id", "local-user")
-    org_id = data.get("org_id", "default-org")
+    org_id = _resolve_org(data.get("org_id"))
+    user_id = _resolve_user(data.get("user_id"))
     if not message.strip():
         raise HTTPException(status_code=400, detail="消息内容不能为空")
+    _guard_thread_owner(thread_id, user_id)
+    _budget_preflight(request, org_id, message)
 
     # 在端点上下文设置 org：Starlette 在线程池迭代同步生成器时，
     # anyio 会把本任务的 contextvars 拷贝到每个工作线程，保证工具路由正确。
@@ -749,13 +1076,17 @@ async def chat_with_file_stream(request: Request):
     data = json.loads(body) if body else {}
     message = data.get("message", "")
     thread_id = data.get("thread_id", "default-thread")
-    user_id = data.get("user_id", "local-user")
-    org_id = data.get("org_id", "default-org")
+    org_id = _resolve_org(data.get("org_id"))
+    user_id = _resolve_user(data.get("user_id"))
     file_id = data.get("file_id")
     if not message.strip():
         raise HTTPException(status_code=400, detail="消息内容不能为空")
+    _guard_thread_owner(thread_id, user_id)
+    _budget_preflight(request, org_id, message)
 
-    # 与 _prepare_message_context 保持一致：文件所属组织的沙箱优先
+    # 与 _prepare_message_context 保持一致：文件所属组织的沙箱优先。
+    # 文件登记在 _file_org_map 里，而上传时 org 已校验过，所以这里取到的
+    # 只可能是本 org（跨 org 的 file_id 会在 _prepare_message_context 里被拒）。
     execution_org = _file_org_map.get(file_id, org_id) if file_id else org_id
     _set_current_org(execution_org)
     return StreamingResponse(
@@ -773,8 +1104,18 @@ async def execute_code(request: Request):
         body = await request.body()
         data = json.loads(body) if body else {}
         code = data.get("code", "")
-        timeout = data.get("timeout", 60)
-        org_id = data.get("org_id", "default-org")
+        org_id = _resolve_org(data.get("org_id"))
+
+        raw_timeout = data.get("timeout", EXECUTE_TIMEOUT_DEFAULT)
+        try:
+            timeout = int(raw_timeout)
+        except (TypeError, ValueError):
+            timeout = EXECUTE_TIMEOUT_DEFAULT
+        # 夹到 [1, EXECUTE_TIMEOUT_MAX]：请求方原先可以把 timeout 设成任意大，
+        # 一个用户就能把 org 的容器长期占住（容器是按 org 复用的）。
+        timeout = max(1, min(timeout, EXECUTE_TIMEOUT_MAX))
+
+        _check_execute_rate(org_id)
 
         result = await asyncio.wait_for(
             asyncio.to_thread(_sync_execute_code, code, timeout, org_id),
@@ -792,17 +1133,72 @@ async def execute_code(request: Request):
 
 
 @router.get("/sandbox/download")
-async def sandbox_download(org_id: str, path: str):
+async def sandbox_download(path: str, org_id: Optional[str] = None):
+    """把沙箱里的文件流给浏览器。
+
+    两道校验，缺一不可：
+
+    1. ``_resolve_org``：org_id 必须与签名身份一致，否则可以取别人的容器；
+    2. ``_safe_download_path``：path 必须落在 /workspace 下且不含 ``..``。
+       在此之前 path 是直接透传给沙箱的 read_bytes 的，``/etc/passwd``
+       这类路径同样会被读出来并作为附件下发。
+
+    该文件是否是「用户该看到的东西」由容器边界保证：一个 org 一个容器，
+    容器内除了用户自己上传的文件，只有 Agent 为它生成的产物。
+    """
     from fastapi.responses import Response
-    content = await asyncio.to_thread(_sync_download_sandbox_file, org_id, path)
+
+    resolved_org = _resolve_org(org_id)
+    safe_path = _safe_download_path(path)
+    if safe_path is None:
+        logger.warning(f"拒绝越界的下载路径：org={resolved_org}, path={path!r}")
+        raise HTTPException(status_code=400, detail="路径必须是 /workspace 下的文件。")
+
+    content = await asyncio.to_thread(_sync_download_sandbox_file, resolved_org, safe_path)
     if content is None:
         raise HTTPException(status_code=404, detail="File not found or sandbox unavailable")
-    filename = path.split("/")[-1]
+    filename = safe_path.rsplit("/", 1)[-1]
     return Response(
         content=content,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"}
     )
+
+
+@router.get("/identity")
+async def get_identity():
+    """把当前身份的 org_id / user_id 告诉前端。
+
+    前端需要 org_id 来拼 thread_id（``org__user__后缀``）与沙箱下载链接，
+    而身份是服务端签发的，所以必须由服务端下发、前端原样回传，不能再由
+    浏览器自己造（旧实现写死 default-org，等于全网共用一个沙箱）。
+    """
+    identity = get_current_identity()
+    if identity is None:
+        raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
+    return {"org_id": identity.org_id, "user_id": identity.user_id}
+
+
+@router.get("/config")
+async def get_runtime_config():
+    """前端需要的运行时开关。
+
+    目前只有一个 ``code_execution``：关闭时前端要隐藏「沙箱」状态与相关文案，
+    否则用户会看到「沙箱未启动」而以为是故障——实际是本部署不提供代码执行。
+    """
+    return {
+        "code_execution": ENABLE_CODE_EXECUTION,
+        "assistant_name": ASSISTANT_NAME,
+    }
+
+
+@router.get("/usage")
+async def get_usage():
+    """当前身份的额度用量快照，供前端在侧栏显示「今日已用 / 上限」。"""
+    identity = get_current_identity()
+    if identity is None:
+        raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
+    return get_budget().snapshot(identity.org_id)
 
 
 @router.get("/sandbox/status")
@@ -811,16 +1207,28 @@ async def sandbox_status():
 
 
 @router.get("/history/{thread_id}", response_model=ChatHistoryResponse)
-async def get_history(thread_id: str):
+async def get_history(thread_id: str, user_id: Optional[str] = None):
+    # 历史里含完整对话与推理轨迹，之前只凭 thread_id 就取——而 thread_id 是
+    # org__user__后缀，知道就能读别人的会话。这里按身份校验归属。
+    # user_id 必须先过 _resolve_user：它会把不一致的声明值换成身份里的值，
+    # 否则请求方传一个跟 thread 里 user 相同的值就能骗过归属校验。
+    _guard_thread_owner(thread_id, _resolve_user(user_id))
     return await asyncio.to_thread(_sync_get_history, thread_id)
 
 
 @router.get("/threads", response_model=List[ThreadInfo])
 async def list_threads(org_id: Optional[str] = None, user_id: Optional[str] = None):
-    return await asyncio.to_thread(_sync_list_threads, org_id, user_id)
+    # 列表按身份过滤：请求里声明的 org/user 一律覆写为身份里的值，
+    # 否则带上别人的 org 就能列出别人的会话标题与最后一条消息。
+    identity = get_current_identity()
+    if identity is None:
+        raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
+    return await asyncio.to_thread(_sync_list_threads, identity.org_id, identity.user_id)
 
 
 @router.delete("/threads/{thread_id}")
-async def delete_thread(thread_id: str):
+async def delete_thread(thread_id: str, user_id: Optional[str] = None):
+    # 删除是不可逆的：不校验归属等于任何人都能删掉别人的全部对话。
+    _guard_thread_owner(thread_id, _resolve_user(user_id))
     await asyncio.to_thread(_sync_delete_thread, thread_id)
     return {"status": "ok"}

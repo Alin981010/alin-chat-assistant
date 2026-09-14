@@ -3,18 +3,74 @@ from typing import Any, List, Optional
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, StoreBackend, StateBackend, FilesystemBackend
+from langchain.chat_models import init_chat_model
 from langgraph.store.postgres import PostgresStore
 from langgraph.checkpoint.postgres import PostgresSaver
 
-from .config import MODEL_NAME, LOCAL_SKILLS_DIR, PPT_SKILL_DIR
+from .config import (
+    AGENT_MAX_OUTPUT_TOKENS,
+    ASSISTANT_NAME,
+    ENABLE_CODE_EXECUTION,
+    MODEL_NAME,
+    LOCAL_SKILLS_DIR,
+    PPT_SKILL_DIR,
+)
 from .context_type import MemoryContext
 from .namespace_router import user_namespace
 from .sandbox import _OrgScopedSandboxBackendProxy, get_sandbox_manager
 
 logger = logging.getLogger(__name__)
 
+
+def build_model():
+    """构造聊天模型，并把单次输出封顶。
+
+    为什么要显式构造而不是把字符串直接交给 ``create_deep_agent``：不设
+    ``max_tokens`` 时，模型可以一路生成到上下文上限，**一次请求就能烧掉
+    整份额度**。这里封顶的是「模型单次回复」，不是整轮对话——agent 可能
+    调用模型多次，那些由 AGENT_RECURSION_LIMIT 控制。
+    """
+    if AGENT_MAX_OUTPUT_TOKENS > 0:
+        logger.info(
+            f"Model {MODEL_NAME}: max_tokens={AGENT_MAX_OUTPUT_TOKENS}（单次回复输出上限）"
+        )
+        return init_chat_model(MODEL_NAME, max_tokens=AGENT_MAX_OUTPUT_TOKENS)
+    logger.warning(f"AGENT_MAX_OUTPUT_TOKENS=0，模型输出不设上限（{MODEL_NAME}）。")
+    return MODEL_NAME
+
 # /memories/AGENTS.md 的初始内容（即系统提示词），首次使用时写入 PostgresStore
-AGENTS_MEMORY_BASE = """你是一个智能助手，可以通过持续对话学习和记录用户的习惯与偏好。
+AGENTS_MEMORY_BASE = """你是「@@NAME@@」，一个通用对话助手。
+
+## 你能做什么
+
+- **信息查询与解答**：历史、科学、文化、生活常识；解释概念与术语；梳理复杂信息
+- **建议与参考**：旅行规划、学习方法、健身计划等（给出方案和取舍，不装作有实时数据）
+- **写作与创作**：文章、报告、邮件、演讲稿、文案；润色与改语气；故事、诗歌、剧本；多语言翻译
+- **编程与技术**：写代码、调试、解释代码逻辑；讲解语言与算法；技术方案建议
+- **分析与处理**：总结长文本、提取要点、对比信息、整理表格、逻辑推理
+- **学习与辅导**：讲知识点、出练习题、辅导作业、制定学习计划
+- **日常陪伴**：闲聊、倾听、情感支持；头脑风暴
+
+## 代码怎么处理（重要）
+
+**代码一律通过对话完成，不执行。** 这既是本部署的设定，也是安全边界：
+
+- 用户把代码**贴进对话**，你读它、讲它、改它，然后把结果以文本返回；
+- **不要声称你运行过代码**，也不要给出「运行输出」——需要验证时，告诉用户怎么自己跑，
+  以及预期看到什么；
+- 需要展示多行代码/配置时，用 Markdown 代码块并标注语言（```python、```bash），
+  方便用户复制；
+- 用户贴代码时不要复述整段，直接针对问题讲：错在哪、为什么错、改成什么。
+- 除非用户要求，不要主动提「我可以执行代码」这类能力。
+
+## 回答原则
+
+- 先给结论，再给必要的展开；不确定就说不确定，别编造事实、数字或引用。
+- 涉及**当前时间、实时天气、精确单位换算**时，必须调用工具，不要凭记忆回答。
+- 涉及你的知识截止之后的事件，明确说明「我的信息可能不是最新」，并建议用户核实。
+- 长内容用小标题和列表组织；简单问题别写长篇。
+- 用户用什么语言提问，就用什么语言回答。
+- 涉及健康、法律、投资等专业决策时，给参考信息并提醒这是建议而非专业意见。
 
 ## 关于用户习惯记录
 
@@ -40,6 +96,20 @@ AGENTS_MEMORY_BASE = """你是一个智能助手，可以通过持续对话学�
 - 敏感信息（密码、密钥、身份证号等）
 - 过期或无意义的闲聊
 """
+
+#: 通用工具的使用说明。工具本身在 tools/general_tools.py 里，这里只写
+#: **什么时候该用**——工具的 docstring 已经说清了参数，重复一遍是浪费 token。
+AGENTS_MEMORY_TOOLS = """
+## 工具
+
+- `get_current_time`：任何涉及「现在 / 今天 / 几号 / 星期几 / 距今多久」的问题都必须先调用。
+  你的训练数据里没有「现在」，凭记忆答必然是错的。
+- `get_weather`：问天气、气温、要不要带伞时调用。返回的是实时数据，直接引用，不要改写数值。
+- `convert_units`：单位换算先调用，不要自己心算——换算系数容易记错。
+- 工具返回失败时，如实告诉用户「查不到」并给出替代方案，**不要编造结果**。
+"""
+
+AGENT_NAME_PLACEHOLDER = "@@NAME@@"
 
 #: PPT 技能段只在本地确实存在该技能时才拼进系统提示词。
 #: 技能目录不存在时，提示词里就不该出现一个用不了的技能，否则模型会去
@@ -71,15 +141,44 @@ AGENTS_MEMORY_PPT = """
 """
 
 
-def build_agents_memory() -> str:
+#: 没有代码执行能力时的替代版本。写成两段独立的文案而不是在提示词里插占位符，
+#: 是因为两者的操作步骤完全不同（一个要调脚本、一个只能给大纲），
+#: 拼在一个字符串里迟早会出现「照着做了一半发现做不了」。
+AGENTS_MEMORY_PPT_NO_EXEC = """
+## PPT 制作（本部署不能生成文件）
+
+**绝不主动提起、推销或询问是否需要制作 PPT。** 只有用户明确要求做 PPT／演示文稿／
+幻灯片／汇报材料时，才按下面处理：
+
+本部署**没有开启代码执行能力**，生成 .pptx 的脚本跑不了，所以：
+
+1. 先说清楚「当前部署不能直接生成文件」，不要让用户等一个不会出现的附件；
+2. 改为在对话里给出**逐页大纲**——页标题 + 每页不超过 5 条要点，用 Markdown 列表，
+   方便用户复制到 PowerPoint / WPS / 石墨等工具里；
+3. 不要假装已经生成了文件，也不要给出任何下载链接。
+"""
+
+
+def build_agents_memory(has_execution: Optional[bool] = None) -> str:
     """按当前仓库实际具备的能力拼出系统提示词。
 
-    目前唯一的可选能力是 PPT 技能：``skills/<PPT_SKILL_DIR.name>/`` 存在才启用，
-    并把技能目录名填进提示词里的 @@SKILL@@ 占位符。
+    ``has_execution`` 为 ``None`` 时读 ``ENABLE_CODE_EXECUTION``；显式传入便于
+    测试两种形态。它决定两件事：是否声明 ``execute`` 能力、以及 PPT 段用哪一版
+    （能跑脚本 vs 只能给大纲）——提示词里出现一个被摘掉的工具，
+    模型就会去调它然后给用户报错。
     """
-    if PPT_SKILL_DIR.exists():
-        return AGENTS_MEMORY_BASE + AGENTS_MEMORY_PPT.replace("@@SKILL@@", PPT_SKILL_DIR.name)
-    return AGENTS_MEMORY_BASE
+    if has_execution is None:
+        has_execution = ENABLE_CODE_EXECUTION
+
+    memory = AGENTS_MEMORY_BASE.replace(AGENT_NAME_PLACEHOLDER, ASSISTANT_NAME)
+    memory += AGENTS_MEMORY_TOOLS
+
+    if not PPT_SKILL_DIR.exists():
+        return memory
+
+    if has_execution:
+        return memory + AGENTS_MEMORY_PPT.replace("@@SKILL@@", PPT_SKILL_DIR.name)
+    return memory + AGENTS_MEMORY_PPT_NO_EXEC
 
 
 # AGENTS.md 是全局配置，与用户无关，统一存放在此命名空间（数据库仅一份）
@@ -217,9 +316,53 @@ def _skill_sources() -> Optional[List[str]]:
     return None
 
 
+def _general_tools() -> List[Any]:
+    """给 agent 挂上通用工具（时间 / 天气 / 单位换算）。"""
+    try:
+        from tools.general_tools import GENERAL_TOOLS
+
+        logger.info(f"已挂载通用工具：{[t.name for t in GENERAL_TOOLS]}")
+        return list(GENERAL_TOOLS)
+    except Exception as e:  # noqa: BLE001
+        # 工具装不上不该让整个服务起不来——对话本身仍然可用，只是少了实时能力。
+        logger.error(f"通用工具加载失败，本次不带工具启动：{e}", exc_info=True)
+        return []
+
+
+def _code_execution_middleware() -> List[Any]:
+    """关闭执行能力时，把 ``execute`` 工具从模型眼前摘掉。
+
+    用 deepagents 自己的 ``_ToolExclusionMiddleware``，它比只看工具列表更硬：
+    除了在 ``wrap_model_call`` 里过滤掉该工具，还会在 ``wrap_tool_call`` 拦截
+    同名调用并回一句 "not available"。于是即使模型在历史上下文里见过
+    ``execute``（例如从旧会话回放），也无法真的执行——「我帮你跑一下」这种
+    回复在物理上不可能发生，而不是仅靠提示词约束。
+    """
+    if ENABLE_CODE_EXECUTION:
+        return []
+    try:
+        from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
+
+        logger.info("已摘除 execute 工具：本部署的代码类请求只走对话。")
+        return [_ToolExclusionMiddleware(excluded=frozenset({"execute"}))]
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"摘除 execute 工具失败（将依赖提示词约束）：{e}", exc_info=True)
+        return []
+
+
 def create_agent(checkpointer: PostgresSaver, store: PostgresStore) -> Any:
     manager = get_sandbox_manager()
-    if manager and manager.available:
+
+    if not ENABLE_CODE_EXECUTION:
+        # 通用对话模式（默认）：不连沙箱、不挂 execute 工具。文件类工具仍然
+        # 指向 default backend，但那只用于读写 /memories 与 /skills 这类虚拟路径，
+        # 用户代码只会在对话里被阅读和讲解。
+        default_backend = StateBackend()
+        logger.info(
+            "代码执行已关闭（ENABLE_CODE_EXECUTION=false）：agent 不挂 execute，"
+            "代码类请求走对话解释。"
+        )
+    elif manager and manager.available:
         default_backend = _OrgScopedSandboxBackendProxy(manager)
         logger.info("Sandbox manager initialized (per-org container, 10-min idle recycle).")
     else:
@@ -227,10 +370,12 @@ def create_agent(checkpointer: PostgresSaver, store: PostgresStore) -> Any:
         logger.warning("Sandbox unavailable, running in degraded mode (no code execution).")
 
     agent = create_deep_agent(
-        model=MODEL_NAME,
+        model=build_model(),
         context_schema=MemoryContext,
         memory=["/memories/AGENTS.md", "/memories/habits.md"],
         skills=_skill_sources(),
+        tools=_general_tools(),
+        middleware=_code_execution_middleware(),
         checkpointer=checkpointer,
         backend=CompositeBackend(
             default=default_backend,

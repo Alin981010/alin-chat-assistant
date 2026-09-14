@@ -3,14 +3,15 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
 from .agent_setup import create_agent, _ensure_agents_memory, _remove_per_user_agents_memory
-from .config import DB_URI, SANDBOX_IMAGE
+from .config import DB_URI, ENABLE_CODE_EXECUTION, SANDBOX_IMAGE
+from .identity import _allowed_origins, identity_middleware
 from .routes import router, set_globals
 from .sandbox import init_sandbox_manager
 
@@ -45,7 +46,13 @@ async def lifespan(app: FastAPI):
         _store.setup()
         _checkpointer.setup()
 
-        init_sandbox_manager(SANDBOX_IMAGE)
+        # 沙箱只在开启代码执行时才探测/预热。默认的通用对话模式不需要容器，
+        # 跳过它同时省掉三件事：docker pull 十几 GB、启动探测超时、
+        # 以及「沙箱不可用」这一类排查噪音。
+        if ENABLE_CODE_EXECUTION:
+            init_sandbox_manager(SANDBOX_IMAGE)
+        else:
+            logger.info("代码执行已关闭：不初始化沙箱（对话模式无需容器）。")
 
         _agent = create_agent(_checkpointer, _store)
         set_globals(_store, _checkpointer, _agent)
@@ -82,12 +89,19 @@ async def lifespan(app: FastAPI):
             logger.error(f"Error stopping sandbox manager: {e}")
 
 
-app = FastAPI(title="阿林助手 · AlinAgent", lifespan=lifespan)
+app = FastAPI(title="阿林对话助手 · Alin Chat Assistant", lifespan=lifespan)
+
+# 身份中间件必须在 CORS 之前注册：Starlette 的中间件是后注册的先执行（洋葱模型），
+# 而 CORS 需要在最外层，才能把预检请求和错误响应也盖上 Access-Control-* 头。
+app.middleware("http")(identity_middleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allowed_origins(),
+    # 匿名身份走 cookie 传递，但这里刻意不开 allow_credentials：
+    # 浏览器规范禁止 allow_origins=["*"] 与 credentials 同时生效，
+    # 且本应用没有需要跨站携带的登录态。跨站调用请用 X-Alin-Agent-Id 头。
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -108,7 +122,7 @@ else:
 async def root():
     if INDEX_HTML.exists():
         return FileResponse(str(INDEX_HTML))
-    return {"status": "ok", "message": "AlinAgent API is running"}
+    return {"status": "ok", "message": "Alin Chat Assistant API is running"}
 
 
 @app.get("/health")

@@ -39,7 +39,7 @@
   const uploadCount = $('#uploadCount');
   const kbCount     = $('#kbCount');
 
-  const META_DEFAULT = 'ALINAGENT · DIALOGUE ENGINE';
+  const META_DEFAULT = 'ALIN CHAT ASSISTANT · DIALOGUE ENGINE';
 
   /* ============================================================
      BACKEND CONTRACT — app/routes.py, mounted under /api
@@ -52,6 +52,7 @@
      DELETE /api/threads/{thread_id}
      GET    /api/sandbox/status           -> { available, active_count }
      GET    /api/sandbox/download?org_id&path
+     GET    /api/identity                 -> { org_id, user_id }
 
      SSE frames are `data: {...}\n\n` with type/fields:
        token{content} · reasoning_token{content} · tool_call{name}
@@ -61,24 +62,54 @@
      splits on "__" (maxsplit 2) to scope the thread list per org/user.
      ============================================================ */
   /* ============================================================
-     IDENTITY — the backend scopes threads by (org_id, user_id) and
-     has no session/identity API, so the browser owns its identity
-     and persists it locally. Threads stay private per browser.
+     IDENTITY — 身份由后端签发（GET /api/identity），浏览器只负责原样回传。
+
+     以前这里自己造 user_id 并把 org_id 写死成 'default-org'，而 org_id 是
+     沙箱容器的隔离键，后果是全网访客共用同一个容器、互相能看见对方的文件。
+     现在后端用签名 cookie 保存匿名身份（app/identity.py），org_id 不再由
+     浏览器决定；这个模块只做两件事：启动时把身份取回来，以及在后端不可用
+     时退化为一个临时身份（此时所有请求都会被后端按身份覆写，不会越权）。
      ============================================================ */
-  const ID_KEY = 'alinagent.identity.v1';
-  const ID = (function(){
+  const ID_KEY = 'alinchat.identity.v1';
+  const ID = { org_id: '', user_id: '' };
+
+  const newThreadId = () => ID.org_id + '__' + ID.user_id + '__' + threadSuffix();
+
+  async function loadIdentity(){
+    try{
+      const r = await fetch('/api/identity', { credentials: 'same-origin' });
+      if(r.ok){
+        const id = await r.json();
+        if(id && id.org_id && id.user_id){
+          ID.org_id = id.org_id;
+          ID.user_id = id.user_id;
+          try{ localStorage.setItem(ID_KEY, JSON.stringify(ID)); }catch(e){}
+          return ID;
+        }
+      }
+    }catch(e){ /* 后端不可达：下面退化为临时身份 */ }
+
+    /* 兜底：后端拿不到身份时（离线预览、mock 后端）沿用浏览器本地身份，
+       但绝不使用 'default-org' —— 那个值在后端会被判为历史遗留、当场换新身份，
+       在这里继续用它只会让 thread_id 与真实身份对不上。 */
     try{
       const raw = JSON.parse(localStorage.getItem(ID_KEY) || 'null');
-      if(raw && raw.user_id && raw.org_id) return raw;
-    }catch(e){ /* storage unavailable → ephemeral identity */ }
+      if(raw && raw.user_id && raw.org_id && raw.org_id !== 'default-org'){
+        ID.org_id = raw.org_id;
+        ID.user_id = raw.user_id;
+        return ID;
+      }
+    }catch(e){ /* storage unavailable */ }
+
     const rnd = (window.crypto && window.crypto.randomUUID
       ? window.crypto.randomUUID().replace(/-/g, '')
       : String(Math.random()).slice(2) + String(Date.now())
     ).slice(0, 12);
-    const fresh = { user_id: 'u' + rnd, org_id: 'default-org' };
-    try{ localStorage.setItem(ID_KEY, JSON.stringify(fresh)); }catch(e){}
-    return fresh;
-  })();
+    ID.org_id = 'o' + rnd;
+    ID.user_id = 'u' + rnd;
+    try{ localStorage.setItem(ID_KEY, JSON.stringify(ID)); }catch(e){}
+    return ID;
+  }
 
   const API = {
     chatStream:       '/api/chat/stream',
@@ -89,6 +120,21 @@
     thread:   id   => '/api/threads/' + encodeURIComponent(id),
     sandbox:          '/api/sandbox/status'
   };
+
+  /* 后端运行时开关（GET /api/config）。code_execution 默认 false：
+     本部署不执行代码，前端据此隐藏沙箱状态、避免显示成「故障」。 */
+  const RUNTIME = { code_execution: null, assistant_name: '小助手' };
+  async function loadRuntimeConfig(){
+    try{
+      const r = await fetch('/api/config', { credentials: 'same-origin' });
+      if(r.ok){
+        const c = await r.json();
+        if(c && typeof c.code_execution === 'boolean') RUNTIME.code_execution = c.code_execution;
+        if(c && c.assistant_name) RUNTIME.assistant_name = c.assistant_name;
+      }
+    }catch(e){ /* 拿不到就按「有沙箱」渲染，不影响对话 */ }
+    return RUNTIME;
+  }
 
   /* ---------- tiny persistent caches (no backend endpoint for these) ---------- */
   const store = {
@@ -101,10 +147,13 @@
       catch(e){ /* quota / private mode: degrade to in-memory only */ }
     }
   };
-  const K_COUNTS = 'alinagent.threadCounts.v1';   /* thread_id -> message count */
-  const K_TITLES = 'alinagent.threadTitles.v1';   /* thread_id -> title         */
-  const K_DOCS   = 'alinagent.docs.v1';           /* [{file_id, filename, at}]  */
-  const K_ACTIVE = 'alinagent.activeThread.v1';
+  /* localStorage 键。这些是**浏览器本地**的缓存键，不进服务端，所以跟着
+     产品名一起改是安全的（代价仅是旧的本地缓存失效一次：会话计数与标题重建）。
+     与 app/identity.py 里的 cookie 名不同——那个改了会让在线用户换身份。 */
+  const K_COUNTS = 'alinchat.threadCounts.v1';   /* thread_id -> message count */
+  const K_TITLES = 'alinchat.threadTitles.v1';   /* thread_id -> title         */
+  const K_DOCS   = 'alinchat.docs.v1';           /* [{file_id, filename, at}]  */
+  const K_ACTIVE = 'alinchat.activeThread.v1';
 
   const state = {
     threadId:    null,
@@ -156,6 +205,9 @@
     "file-search":"M15 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6ZM15 2v4h4M9.5 15.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5ZM11.5 15.5 13.5 17.5",
     "list-checks":"M3 6l2 2 4-4M3 14l2 2 4-4M13 7h8M13 15h8M13 19h8",
     "scan-text":"M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M7 8h8M7 12h10M7 16h6",
+    "pen-line":"M4 20h4L20 8a2.5 2.5 0 0 0-3.5-3.5L4 16ZM3 22h10",
+    "code":"M9 8 5 12l4 4M15 8l4 4-4 4",
+    "graduation-cap":"M12 3 2 8l10 5 10-5ZM6 11v5c0 1.7 2.7 3 6 3s6-1.3 6-3v-5",
     "git-branch":"M6 3v12M18 9v.01M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM18 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM15 6h1a2 2 0 0 1 2 2v1",
     "user":"M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z",
     "sparkles":"M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9ZM19 15l.9 2.4L22 18.3l-2.1.9L19 21.5l-.9-2.3L16 18.3l2.1-.9ZM5 16l.7 1.8L7.5 18.5l-1.8.7L5 21l-.7-1.8L2.5 18.5l1.8-.7Z",
@@ -235,7 +287,6 @@
     );
     return rnd.slice(0, 8);
   };
-  const newThreadId = () => ID.org_id + '__' + ID.user_id + '__' + threadSuffix();
 
   function shortId(id){
     if(!id) return '';
@@ -368,21 +419,30 @@
   }
 
   /* ---------- render: hero ---------- */
+  /* 示例问题按新的能力定位排：先是「这能干什么」，再各覆盖一类真实用途
+     （写作、代码讲解、分析、学习）。点一下就直接问，比写一段能力介绍有用。 */
+  const HERO_CHIPS = [
+    ['你能做什么？', 'file-search'],
+    ['帮我把这段话改得更正式一些', 'pen-line'],
+    ['这段 Python 报错了，帮我看看为什么', 'code'],
+    ['把这份材料总结成三个要点', 'list-checks'],
+    ['给我讲讲复利是怎么算的', 'graduation-cap']
+  ];
+
   function renderHero(){
+    const chips = HERO_CHIPS.map(([q, icon]) =>
+      '<button class="chip" data-q="' + escapeHtml(q) + '"><i data-icon="' + icon + '"></i>' + escapeHtml(q) + '</button>'
+    ).join('');
     stage.innerHTML =
       '<div class="hero">' +
-        '<div class="eyebrow"><span class="rule"></span><span id="heroEyebrow">ALINAGENT · DIALOGUE ENGINE</span></div>' +
+        '<div class="eyebrow"><span class="rule"></span><span id="heroEyebrow">ALIN CHAT ASSISTANT · DIALOGUE ENGINE</span></div>' +
         '<h1><span class="line" data-text="每个问题"></span><span class="line" data-text="都有回应"></span></h1>' +
-        '<p>会聊，也会动手。回答问题之外，它还能读你的文件、在沙箱里<strong>真的跑一段代码</strong>再给你结论。</p>' +
-        '<div class="chips">' +
-          '<button class="chip" data-q="你能做什么？"><i data-icon="file-search"></i>你能做什么？</button>' +
-          '<button class="chip" data-q="总结最近聊过的重点"><i data-icon="list-checks"></i>总结最近聊过的重点</button>' +
-          '<button class="chip" data-q="帮我提炼这段材料的主旨"><i data-icon="scan-text"></i>提炼一段材料的主旨</button>' +
-          '<button class="chip" data-q="某个结论的依据是什么？"><i data-icon="git-branch"></i>追问某个结论的依据</button>' +
-        '</div>' +
+        '<p>会聊，也讲得清楚。问答、写作、翻译、编程、分析都在这一个对话框里——' +
+        '贴代码进来它会<strong>逐段讲给你听</strong>，而不是只丢一句结论。</p>' +
+        '<div class="chips">' + chips + '</div>' +
       '</div>';
     splitHeadline();
-    scrambleText($('#heroEyebrow'), 'ALINAGENT · DIALOGUE ENGINE', 800);
+    scrambleText($('#heroEyebrow'), 'ALIN CHAT ASSISTANT · DIALOGUE ENGINE', 800);
     $$('.chip').forEach(ch => ch.addEventListener('click', ()=>{ setInput(ch.dataset.q); autoGrow(); input.focus(); }));
     icons();
   }
@@ -462,7 +522,7 @@
     who.className = 'who';
     who.innerHTML = role === 'user'
       ? '<span class="role">operator</span><span class="name">You</span>'
-      : '<span class="name">阿林助手</span><span class="role">assistant</span>';
+      : '<span class="name">' + escapeHtml(RUNTIME.assistant_name) + '</span><span class="role">assistant</span>';
     content.appendChild(who);
 
     if(role !== 'user'){
@@ -594,6 +654,11 @@
       case 'error':
         sink.error = new Error(d.message || '生成出错');
         break;
+      case 'budget':
+        /* 后端在额度耗尽、截断生成时发来的提示。不是错误：已生成的内容有效，
+           只是这一轮不完整。单独记一笔，让调用方决定怎么呈现。 */
+        sink.budget = d;
+        break;
       case 'done':
         sink.final = d;
         sink.finished = true;
@@ -710,7 +775,13 @@
         refs.reason.hidden = false;
         refs.rbody.textContent = reasonAcc;
       }
+      if(sink.budget){
+        /* 额度耗尽导致本轮被截断：内容仍然有效，所以不当作错误，
+           只提示一句并刷新额度条。 */
+        toastShow(sink.budget.message || '今日额度已用完', true);
+      }
       finalize();
+      refreshUsage();
     }catch(err){
       streamErr = err;
       think.remove();
@@ -1021,6 +1092,15 @@
   };
   async function refreshSandboxStatus(){
     if(!engineState) return;
+    /* 代码执行关闭的部署（默认）：不显示沙箱状态，否则会看到「沙箱未启动」
+       而误以为是故障。此时显示的是对话模式的定位。 */
+    if(RUNTIME.code_execution === false){
+      engineState.classList.remove('degraded');
+      engineState.innerHTML = '<span class="dot"></span>对话模式';
+      engineState.title = '本部署不执行代码：贴代码进来，我会直接讲给你听。';
+      engineState.style.cursor = 'help';
+      return;
+    }
     try{
       const s = await api(API.sandbox);
       const on = !!(s && s.available);
@@ -1033,6 +1113,34 @@
       engineState.classList.add('degraded');
       engineState.innerHTML = '<span class="dot"></span>offline';
       engineState.title = e.message || '';
+    }
+  }
+
+  /* 今日额度条。后端按「签名身份」计量 token，用完了后续请求会 429，
+     所以这里提前把余量摆出来，免得用户毫无预兆地撞上拒绝。 */
+  const quotaBar = $('#quotaBar');
+  const quotaValue = $('#quotaValue');
+  const quotaFill = $('#quotaFill');
+  function fmtTokens(n){
+    if(!n) return '0';
+    if(n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if(n >= 1000) return Math.round(n / 1000) + 'k';
+    return String(n);
+  }
+  async function refreshUsage(){
+    if(!quotaBar) return;
+    try{
+      const u = await api('/api/usage');
+      if(!u || !u.tokens_budget){ quotaBar.hidden = true; return; }   /* 0 = 不限 */
+      const used = u.tokens_used || 0;
+      const pct = Math.min(100, Math.round(used * 100 / u.tokens_budget));
+      quotaBar.hidden = false;
+      quotaValue.textContent = fmtTokens(used) + ' / ' + fmtTokens(u.tokens_budget);
+      quotaFill.style.width = pct + '%';
+      quotaBar.classList.toggle('is-low', pct >= 80);
+      quotaBar.title = '今日已用 ' + used + ' tokens（上限 ' + u.tokens_budget + '）';
+    }catch(e){
+      quotaBar.hidden = true;
     }
   }
 
@@ -1085,19 +1193,27 @@
   }
 
   async function boot(){
+    /* 身份必须最先取：thread_id 由 org__user__后缀 拼成，而下面每一步
+       （恢复会话、列会话、发消息）都依赖它。 */
+    await loadIdentity();
+    await loadRuntimeConfig();
+
     initParallax();
     icons();
     renderFiles();
     renderAttachments();
     updateKbCount();
     syncSendState();
-    scrambleText(wordmark, '阿林助手', 1100);
+    /* 用 DOM 里已有的字做「乱码归位」动画：改产品名只需要动 index.html 一处，
+       不会再出现「标题换了、动画里还是旧名字」这种漏改。 */
+    scrambleText(wordmark, wordmark.dataset.scramble || wordmark.textContent, 1100);
 
     const restored = await restoreActiveThread();
     if(!restored) renderThread();
 
     await loadThreads();
     refreshSandboxStatus();
+    refreshUsage();
     if(window.innerWidth >= 900) input.focus();
   }
   boot();

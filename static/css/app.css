@@ -1,5 +1,5 @@
 /* ============================================================
-  阿林助手 · AlinAgent  (v3 — 剪纸绘)
+   阿林对话助手 · Alin Chat Assistant  (v3 — 剪纸绘)
    ------------------------------------------------------------
    Direction: layered paper-cut collage.
    · Every surface is a sheet of cut paper: hard offset shadow,
@@ -377,6 +377,26 @@ button:focus-visible, textarea:focus-visible, a:focus-visible{
 .rail-foot{ display:flex; align-items:center; justify-content:space-between; padding:2px 4px 0; }
 .rail-foot .ver{ font-family:var(--font-mono); font-size:10px; color:var(--ink-4); letter-spacing:.06em; }
 .rail-foot .sync{ display:flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:10px; color:var(--ink-3); }
+
+/* 今日额度条：贴在 rail-foot 下方。默认隐藏，后端说「不限」时不占位。 */
+.rail-quota{
+  display:grid; grid-template-columns:auto auto; align-items:center; gap:4px 8px;
+  padding:8px 4px 0; font-family:var(--font-mono); font-size:10px; color:var(--ink-4);
+  letter-spacing:.04em;
+}
+.rail-quota[hidden]{ display:none; }
+.rail-quota .q-value{ justify-self:end; color:var(--ink-3); }
+.rail-quota .q-track{
+  grid-column:1 / -1; height:3px; border-radius:2px; overflow:hidden;
+  background:color-mix(in srgb, var(--ink-4) 22%, transparent);
+}
+.rail-quota .q-fill{
+  display:block; height:100%; width:0%; border-radius:2px;
+  background:var(--accent); transition:width .3s ease;
+}
+/* 余量告急：只换颜色，不闪烁——侧栏常驻，动效会变成噪音。 */
+.rail-quota.is-low{ color:var(--red-2); }
+.rail-quota.is-low .q-fill{ background:var(--red); }
 
 /* ============================================================
    MAIN

@@ -1,0 +1,68 @@
+# 阿林对话助手 · Alin Chat Assistant —— 单机部署编排
+#
+# 为什么需要这个文件：app 的 lifespan 启动时就会连 Postgres 建 checkpoint 表，
+# 连不上直接启动失败退出。所以 DB 不是可选项，必须和 app 一起编排。
+#
+#   cp .env.example .env && 填好密钥
+#   docker compose up -d --build
+#
+# .env 里需要两个变量（compose 用它做变量替换，同时也会注入到容器）：
+#   DEEPSEEK_API_KEY=sk-...
+#   POSTGRES_PASSWORD=<自己生成一个>
+# DB_URI 不写进 .env —— 由下面的 environment 统一给，避免踩 "127.0.0.1 在容器里
+# 指的是容器自己" 这个经典坑。
+#
+# 注意 POSTGRES_DB / POSTGRES_USER 是**数据库内部**的名字，不是品牌名：
+# 改它等于换库，已有 checkpoint 与长期记忆都读不到。所以这里保持 alinAgent 不动。
+
+services:
+  db:
+    image: postgres:18-alpine
+    container_name: alin-chat-assistant-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_DB: alinAgent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?必须在 .env 里设置 POSTGRES_PASSWORD}
+    volumes:
+      # 注意：postgres 18 起数据目录布局变了，官方镜像要求挂 /var/lib/postgresql
+      # （数据落在版本号子目录里，便于 pg_upgrade --link 不被挂载点边界卡住）。
+      # 沿用 17 及以前的 /var/lib/postgresql/data 会让镜像直接拒绝启动，报
+      # "there appears to be PostgreSQL data in: /var/lib/postgresql/data"。
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # app 必须等数据库真的能接受连接，光 depends_on 是不够的
+      test: ["CMD-SHELL", "pg_isready -U root -d alinAgent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [alin]
+    # 故意不映射 5432 到宿主机：只有 app 需要连它，没必要对外暴露
+
+  app:
+    build: .
+    image: alin-chat-assistant:latest
+    container_name: alin-chat-assistant-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DB_URI: postgresql://root:${POSTGRES_PASSWORD}@db:5432/alinAgent
+      HOST: 0.0.0.0
+      PORT: "8088"
+      # 代码执行默认关闭（ENABLE_CODE_EXECUTION=false）：纯对话模式，不需要沙箱。
+      # 要打开时把下面两行取消注释，并设 ENABLE_CODE_EXECUTION=true。
+      # OPEN_SANDBOX_DOMAIN: host.docker.internal:8080
+      # SANDBOX_USE_SERVER_PROXY: "true"
+    ports:
+      - "8088:8088"
+    networks: [alin]
+
+volumes:
+  pgdata:
+
+networks:
+  alin:

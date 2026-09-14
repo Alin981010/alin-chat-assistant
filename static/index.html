@@ -4,8 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="color-scheme" content="light" />
-<meta name="description" content="阿林助手（AlinAgent）—— 会思考、能上手的对话助手，可以在沙箱里真跑代码。" />
-<title>阿林助手 · AlinAgent</title>
+<meta name="description" content="阿林对话助手（Alin Chat Assistant）—— 问答、写作、翻译、编程、分析都能在一个对话框里完成的通用对话助手。" />
+<title>阿林对话助手 · Alin Chat Assistant</title>
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cg fill='%23C63A2B'%3E%3Ccircle cx='24' cy='24' r='9'/%3E%3Cellipse cx='24' cy='10' rx='6' ry='8'/%3E%3Cellipse cx='24' cy='38' rx='6' ry='8'/%3E%3Cellipse cx='10' cy='24' rx='8' ry='6'/%3E%3Cellipse cx='38' cy='24' rx='8' ry='6'/%3E%3Cellipse cx='14' cy='14' rx='6' ry='6' transform='rotate(-45 14 14)'/%3E%3Cellipse cx='34' cy='34' rx='6' ry='6' transform='rotate(-45 34 34)'/%3E%3Cellipse cx='34' cy='14' rx='6' ry='6' transform='rotate(45 34 14)'/%3E%3Cellipse cx='14' cy='34' rx='6' ry='6' transform='rotate(45 14 34)'/%3E%3C/g%3E%3Ccircle cx='24' cy='24' r='7' fill='%23FBF4E6'/%3E%3C/svg%3E" />
 
@@ -49,8 +49,8 @@
 <!-- ===== edge cut-paper band ===== -->
 <div class="edge-marquee" aria-hidden="true">
   <div class="edge-track">
-    <span>ALINAGENT · 阿林助手 · DIALOGUE · SANDBOX · </span>
-    <span>ALINAGENT · 阿林助手 · DIALOGUE · SANDBOX · </span>
+    <span>ALIN CHAT ASSISTANT · 阿林对话助手 · DIALOGUE · </span>
+    <span>ALIN CHAT ASSISTANT · 阿林对话助手 · DIALOGUE · </span>
   </div>
 </div>
 
@@ -72,8 +72,8 @@
       <div class="brand">
         <div class="brand-glyph"><i data-icon="hexagon"></i></div>
         <div class="brand-word">
-          <span class="name" id="wordmark" data-scramble="阿林助手">阿林助手</span>
-          <span class="tag">AlinAgent</span>
+          <span class="name" id="wordmark" data-scramble="阿林对话助手">阿林对话助手</span>
+          <span class="tag">Alin Chat Assistant</span>
         </div>
       </div>
       <button class="new-btn" id="newBtn" type="button"><i data-icon="plus"></i><span>新会话</span></button>
@@ -87,6 +87,13 @@
       <span class="ver">v0.1.0 · 剪纸</span>
       <span class="sync" id="engineState"><span class="dot"></span>连接中…</span>
     </div>
+    <!-- 今日额度：后端按签名身份计量，超限会直接 429。这里只做「让人心里有数」，
+         数值来自 GET /api/usage。 -->
+    <div class="rail-quota" id="quotaBar" hidden>
+      <span class="q-label">今日额度</span>
+      <span class="q-value" id="quotaValue">—</span>
+      <span class="q-track"><span class="q-fill" id="quotaFill"></span></span>
+    </div>
   </aside>
 
   <div class="scrim" id="scrim"></div>
@@ -97,10 +104,10 @@
       <button class="menu-btn" id="menuBtn" type="button" aria-label="打开侧栏"><i data-icon="panel-left"></i></button>
       <div class="crumb">
         <span class="t" id="crumbTitle">选择一个会话</span>
-        <span class="s" id="crumbMeta">ALINAGENT · DIALOGUE ENGINE</span>
+        <span class="s" id="crumbMeta">ALIN CHAT ASSISTANT · DIALOGUE ENGINE</span>
       </div>
       <div class="top-right">
-        <div class="model-pill"><span class="pulse"></span>ALINAGENT</div>
+        <div class="model-pill"><span class="pulse"></span>ALIN CHAT</div>
         <button class="top-icon" id="newTop" type="button" aria-label="新对话"><i data-icon="square-pen"></i></button>
       </div>
     </header>

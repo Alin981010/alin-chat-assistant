@@ -135,8 +135,11 @@ async function main() {
 
     const sent = await (await fetch('http://127.0.0.1:' + PORT + '/__log')).json();
     const chatReq = sent.requests.filter(r => r.url === '/api/chat/stream').pop();
+    /* org_id / user_id 现在由后端 GET /api/identity 下发（mock 里是 MOCK_IDENTITY），
+       前端不再自己造身份、也不再写死 default-org：thread_id 必须用下发的那两个值拼。 */
     check('POST /api/chat/stream used the backend field names',
-      !!chatReq && /"thread_id":"default-org__u[^"]*__[0-9a-f]{8}"/.test(chatReq.body) && /"org_id":"default-org"/.test(chatReq.body),
+      !!chatReq && /"thread_id":"omock[^"]*__umock[^"]*__[0-9a-f]{8}"/.test(chatReq.body) &&
+      /"org_id":"omock[0-9a-z]*"/.test(chatReq.body) && !/"org_id":"default-org"/.test(chatReq.body),
       chatReq && chatReq.body);
     check('new thread appears in the rail right after send',
       await evalJs("document.querySelectorAll('#sessionList .session-item').length") >= 1);
