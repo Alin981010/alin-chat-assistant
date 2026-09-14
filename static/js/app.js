@@ -39,6 +39,23 @@
   const uploadCount = $('#uploadCount');
   const kbCount     = $('#kbCount');
 
+  const acctOpen    = $('#acctOpen');
+  const acctLabel   = $('#acctLabel');
+  const acctLogout  = $('#acctLogout');
+  const authModal   = $('#authModal');
+  const authClose   = $('#authClose');
+  const authForm    = $('#authForm');
+  const authUser    = $('#authUser');
+  const authPass    = $('#authPass');
+  const authError   = $('#authError');
+  const authTitle   = $('#authTitle');
+  const authSub     = $('#authSub');
+  const authGo      = $('#authGo');
+  const authGoLabel = $('#authGoLabel');
+  const authNote    = $('#authNote');
+  const tabLogin    = $('#tabLogin');
+  const tabRegister = $('#tabRegister');
+
   const META_DEFAULT = 'ALIN CHAT ASSISTANT · DIALOGUE ENGINE';
 
   /* ============================================================
@@ -134,6 +151,42 @@
       }
     }catch(e){ /* 拿不到就按「有沙箱」渲染，不影响对话 */ }
     return RUNTIME;
+  }
+
+  /* ============================================================
+     账号状态
+
+     **档位由服务端判定**（游客 / 会员），前端只负责呈现——本地没有任何办法
+     把自己变成会员。游客额度很小（见 app/limits.py），撞到额度时后端会返回
+     一条引导注册的提示，这里把它变成"打开注册弹窗"的动作。
+     ============================================================ */
+  const ACCOUNT = { registered: false, tier: 'guest', username: null };
+
+  const isGuest = () => !ACCOUNT.registered;
+
+  async function loadAccountState(){
+    try{
+      const r = await fetch('/api/auth/me', { credentials: 'same-origin' });
+      if(r.ok){
+        const d = await r.json();
+        ACCOUNT.registered = !!d.registered;
+        ACCOUNT.tier = d.tier || 'guest';
+        ACCOUNT.username = (d.user && d.user.username) || null;
+      }
+    }catch(e){ /* 未登录或后端不可用：按游客处理 */ }
+    renderAccount();
+    return ACCOUNT;
+  }
+
+  function renderAccount(){
+    if(acctLabel){
+      acctLabel.textContent = ACCOUNT.registered ? (ACCOUNT.username || '已登录') : '登录 / 注册';
+    }
+    if(acctOpen) acctOpen.classList.toggle('is-member', ACCOUNT.registered);
+    if(acctLogout) acctLogout.hidden = !ACCOUNT.registered;
+    if(quotaLabel) quotaLabel.textContent = ACCOUNT.registered ? '今日额度' : '体验额度';
+    if(quotaBar) quotaBar.classList.toggle('is-guest', isGuest());
+    applyGuestGating();
   }
 
   /* ---------- tiny persistent caches (no backend endpoint for these) ---------- */
@@ -384,6 +437,9 @@
       renderSessions();
     }catch(e){
       if(isStaleSessionError(e)){ recoverFromStaleSession(id); return; }
+      /* 游客权限被拒（例如上传、或游客额度相关）时不要弹红错误，
+         直接给注册入口——后端文案里已经写清了原因。 */
+      if(/注册/.test(e.message || '')){ toastShow(e.message); if(isGuest()) openAuth('register'); return; }
       toastShow(e.message || '加载会话失败', true);
     }
   }
@@ -839,9 +895,12 @@
         refs.rbody.textContent = reasonAcc;
       }
       if(sink.budget){
-        /* 额度耗尽导致本轮被截断：内容仍然有效，所以不当作错误，
-           只提示一句并刷新额度条。 */
-        toastShow(sink.budget.message || '今日额度已用完', true);
+        /* 额度耗尽导致本轮被截断：内容仍然有效，所以不当作错误。
+           游客撞到额度是最值得好好说话的一次——多半就是这个时刻决定他会不会注册，
+           所以除了提示，直接把注册弹窗准备好（不自动弹，避免打断阅读）。 */
+        const msg = sink.budget.message || '今日额度已用完';
+        toastShow(msg, true);
+        if(isGuest()) setTimeout(()=> openAuth('register'), 400);
       }
       finalize();
       refreshUsage();
@@ -1182,11 +1241,13 @@
     }
   }
 
-  /* 今日额度条。后端按「签名身份」计量 token，用完了后续请求会 429，
-     所以这里提前把余量摆出来，免得用户毫无预兆地撞上拒绝。 */
+  /* 额度条。后端按「签名身份 + 档位」计量 token，用完了后续请求会 429，
+     所以这里提前把余量摆出来，免得用户毫无预兆地撞上拒绝。
+     游客档很小（2 万），基本几条就到顶——所以顺带做注册引导。 */
   const quotaBar = $('#quotaBar');
   const quotaValue = $('#quotaValue');
   const quotaFill = $('#quotaFill');
+  const quotaLabel = $('#quotaLabel');
   function fmtTokens(n){
     if(!n) return '0';
     if(n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -1199,15 +1260,138 @@
       const u = await api('/api/usage');
       if(!u || !u.tokens_budget){ quotaBar.hidden = true; return; }   /* 0 = 不限 */
       const used = u.tokens_used || 0;
-      const pct = Math.min(100, Math.round(used * 100 / u.tokens_budget));
+      const budget = u.tokens_budget;
+      const pct = Math.min(100, Math.round(used * 100 / budget));
       quotaBar.hidden = false;
-      quotaValue.textContent = fmtTokens(used) + ' / ' + fmtTokens(u.tokens_budget);
+      quotaValue.textContent = fmtTokens(used) + ' / ' + fmtTokens(budget);
       quotaFill.style.width = pct + '%';
       quotaBar.classList.toggle('is-low', pct >= 80);
-      quotaBar.title = '今日已用 ' + used + ' tokens（上限 ' + u.tokens_budget + '）';
+      /* 档位以后端返回的为准：它才是真正在计量的那一方 */
+      if(u.tier) ACCOUNT.tier = u.tier;
+      quotaBar.title = (ACCOUNT.registered ? '今日' : '游客体验')
+        + '已用 ' + used + ' tokens（上限 ' + budget + '）';
+      /* 游客额度快见底时把注册入口点亮，别等他撞到 429 才知道有这回事 */
+      if(isGuest() && pct >= 70){
+        quotaBar.classList.add('is-low');
+        quotaBar.title += ' —— 注册后可获得完整额度';
+      }
     }catch(e){
       quotaBar.hidden = true;
     }
+  }
+
+  /* ---------- auth modal ---------- */
+  let authMode = 'login';
+
+  function setAuthMode(mode){
+    authMode = mode === 'register' ? 'register' : 'login';
+    const reg = authMode === 'register';
+    if(tabLogin) tabLogin.classList.toggle('is-on', !reg);
+    if(tabRegister) tabRegister.classList.toggle('is-on', reg);
+    if(authTitle) authTitle.textContent = reg ? '注册账号' : '登录';
+    if(authSub) authSub.textContent = reg
+      ? '注册后额度大幅提高，历史会话绑定账号，换设备也能看到'
+      : '游客只能体验很少的额度；登录后恢复完整额度';
+    if(authGoLabel) authGoLabel.textContent = reg ? '注册并登录' : '登录';
+    if(authPass) authPass.setAttribute('autocomplete', reg ? 'new-password' : 'current-password');
+    if(authNote){
+      authNote.textContent = ACCOUNT.registered
+        ? ('当前账号：' + (ACCOUNT.username || ''))
+        : '游客体验额度：每天约 2 万 token、每分钟 3 次';
+    }
+    hideAuthError();
+  }
+
+  function showAuthError(msg){
+    if(!authError) return;
+    authError.textContent = msg || '';
+    authError.hidden = !msg;
+  }
+  function hideAuthError(){ showAuthError(''); }
+
+  function openAuth(mode){
+    if(!authModal) return;
+    setAuthMode(mode || (ACCOUNT.registered ? 'login' : 'register'));
+    authModal.hidden = false;
+    requestAnimationFrame(()=> authModal.classList.add('open'));
+    document.body.classList.add('modal-open');
+    setTimeout(()=> { if(authUser) authUser.focus(); }, 30);
+  }
+  function closeAuth(){
+    if(!authModal) return;
+    authModal.classList.remove('open');
+    authModal.hidden = true;
+    document.body.classList.remove('modal-open');
+    hideAuthError();
+    if(authPass) authPass.value = '';
+  }
+
+  async function submitAuth(ev){
+    if(ev) ev.preventDefault();
+    if(!authUser || !authPass) return;
+    const username = authUser.value.trim();
+    const password = authPass.value;
+    if(!username || !password){ showAuthError('请填写用户名和密码。'); return; }
+
+    const url = authMode === 'register' ? '/api/auth/register' : '/api/auth/login';
+    authGo.disabled = true;
+    hideAuthError();
+    try{
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json().catch(()=> ({}));
+      if(!res.ok){
+        showAuthError(data.detail || ('操作失败 HTTP ' + res.status));
+        return;
+      }
+      ACCOUNT.registered = true;
+      ACCOUNT.tier = data.tier || 'member';
+      ACCOUNT.username = (data.user && data.user.username) || username;
+      renderAccount();
+      closeAuth();
+      hideAuthError();
+      toastShow(authMode === 'register' ? '注册成功，已登录' : '已登录');
+      /* 登录会换档位（也是换额度），要拉一次用量让进度条立刻反映新额度 */
+      refreshUsage();
+      /* 历史是按 user_id 存的：登录后命名空间变了，重新拉会话列表 */
+      await loadThreads();
+      applyBlank();
+    }catch(e){
+      showAuthError('网络错误：' + (e.message || '请稍后重试'));
+    }finally{
+      authGo.disabled = false;
+    }
+  }
+
+  async function logout(){
+    try{
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    }catch(e){ /* 清本地状态即可 */ }
+    ACCOUNT.registered = false;
+    ACCOUNT.tier = 'guest';
+    ACCOUNT.username = null;
+    renderAccount();
+    toastShow('已退出登录');
+    refreshUsage();
+    await loadThreads();
+    applyBlank();
+  }
+
+  /* 游客不能用上传：文件解析一次性吃掉的上下文远超游客额度（2 万 token），
+     放行只会得到"传了文件却分析不出来"。后端也会拒（_require_member），
+     前端这里只是别让按钮看起来能用。 */
+  function applyGuestGating(){
+    const guest = isGuest();
+    if(uploadBtn){
+      uploadBtn.disabled = guest;
+      uploadBtn.title = guest ? '上传文件需要注册账号' : '';
+      uploadBtn.classList.toggle('is-locked', guest);
+    }
+    if(attachBar) attachBar.classList.toggle('is-locked', guest);
   }
 
   /* ---------- wire up ---------- */
@@ -1225,7 +1409,15 @@
   railClose.addEventListener('click', ()=> setRail(false));
   scrim.addEventListener('click', ()=> setRail(false));
 
-  uploadBtn.addEventListener('click', openUpload);
+  uploadBtn.addEventListener('click', ()=>{
+    /* 游客点了上传：直接引导注册，而不是让他传完文件再被后端拒 */
+    if(isGuest()){
+      toastShow('上传文件需要注册账号，注册是免费的');
+      openAuth('register');
+      return;
+    }
+    openUpload();
+  });
   uploadClose.addEventListener('click', closeUpload);
   uploadModal.addEventListener('click', e=>{ if(e.target === uploadModal) closeUpload(); });
   document.addEventListener('keydown', e=>{ if(e.key === 'Escape' && !uploadModal.hidden) closeUpload(); });
@@ -1236,6 +1428,22 @@
   ['dragleave','dragend'].forEach(ev => dropzone.addEventListener(ev, ()=> dropzone.classList.remove('over')));
   dropzone.addEventListener('drop', e=>{ e.preventDefault(); dropzone.classList.remove('over'); addFiles(e.dataTransfer.files); });
   uploadGo.addEventListener('click', doUpload);
+
+  /* ---------- auth wiring ---------- */
+  if(acctOpen) acctOpen.addEventListener('click', ()=>{
+    if(ACCOUNT.registered){ openAuth('login'); return; }
+    openAuth('register');
+  });
+  if(acctLogout) acctLogout.addEventListener('click', (ev)=>{ ev.stopPropagation(); logout(); });
+  if(authClose) authClose.addEventListener('click', closeAuth);
+  if(authModal) authModal.addEventListener('click', ev=>{ if(ev.target === authModal) closeAuth(); });
+  if(tabLogin) tabLogin.addEventListener('click', ()=> setAuthMode('login'));
+  if(tabRegister) tabRegister.addEventListener('click', ()=> setAuthMode('register'));
+  if(authForm) authForm.addEventListener('submit', submitAuth);
+  if(authGo) authGo.addEventListener('click', submitAuth);
+  document.addEventListener('keydown', ev=>{
+    if(ev.key === 'Escape' && authModal && authModal.classList.contains('open')) closeAuth();
+  });
 
   /* ---------- boot ---------- */
   async function restoreActiveThread(){
@@ -1267,9 +1475,11 @@
 
   async function boot(){
     /* 身份必须最先取：thread_id 由 org__user__后缀 拼成，而下面每一步
-       （恢复会话、列会话、发消息）都依赖它。 */
+       （恢复会话、列会话、发消息）都依赖它。
+       账号状态要紧跟其后：它决定额度档位，也决定上传按钮可不可用。 */
     await loadIdentity();
     await loadRuntimeConfig();
+    await loadAccountState();
 
     initParallax();
     icons();
@@ -1277,6 +1487,7 @@
     renderAttachments();
     updateKbCount();
     syncSendState();
+    applyGuestGating();
     /* 用 DOM 里已有的字做「乱码归位」动画：改产品名只需要动 index.html 一处，
        不会再出现「标题换了、动画里还是旧名字」这种漏改。 */
     scrambleText(wordmark, wordmark.dataset.scramble || wordmark.textContent, 1100);

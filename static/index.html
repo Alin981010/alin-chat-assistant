@@ -83,14 +83,23 @@
 
     <nav class="session-list" id="sessionList" aria-label="会话历史"></nav>
 
+    <!-- 账号状态：游客显示「登录 / 注册」，登录后显示用户名与登出。
+         额度分档由服务端判定（游客额度很小），这里只负责呈现。 -->
+    <div class="rail-account" id="accountBar">
+      <button class="acct-btn" id="acctOpen" type="button">
+        <i data-icon="user"></i><span id="acctLabel">登录 / 注册</span>
+      </button>
+      <button class="acct-out" id="acctLogout" type="button" hidden title="退出登录">退出</button>
+    </div>
+
     <div class="rail-foot">
       <span class="ver">v0.1.0 · 剪纸</span>
       <span class="sync" id="engineState"><span class="dot"></span>连接中…</span>
     </div>
-    <!-- 今日额度：后端按签名身份计量，超限会直接 429。这里只做「让人心里有数」，
-         数值来自 GET /api/usage。 -->
+    <!-- 额度条：游客显示「体验额度」，注册后显示「今日额度」。数值来自 GET /api/usage，
+         超限时后端直接 429。 -->
     <div class="rail-quota" id="quotaBar" hidden>
-      <span class="q-label">今日额度</span>
+      <span class="q-label" id="quotaLabel">今日额度</span>
       <span class="q-value" id="quotaValue">—</span>
       <span class="q-track"><span class="q-fill" id="quotaFill"></span></span>
     </div>
@@ -169,6 +178,46 @@
     <footer class="modal-foot">
       <div class="modal-note"><i data-icon="info"></i><span id="fileHint">支持 PDF / DOCX / XLSX / CSV / MD / TXT</span></div>
       <button class="modal-primary" id="uploadGo" type="button" disabled><i data-icon="rocket"></i>开始上传<span class="n" id="uploadCount">0</span></button>
+    </footer>
+  </div>
+</div>
+
+<!-- ===================== AUTH MODAL ===================== -->
+<div class="modal-overlay" id="authModal" hidden>  <div class="modal modal-auth" role="dialog" aria-modal="true" aria-label="登录或注册">
+    <header class="modal-head">
+      <div class="modal-title">
+        <div class="modal-ic"><i data-icon="user"></i></div>
+        <div>
+          <h2 id="authTitle">登录</h2>
+          <p id="authSub">游客只能体验很少的额度；注册后额度大幅提高，并保留历史会话</p>
+        </div>
+      </div>
+      <button class="modal-close" id="authClose" type="button" aria-label="关闭"><i data-icon="x"></i></button>
+    </header>
+
+    <div class="auth-tabs" role="tablist">
+      <button class="auth-tab is-on" id="tabLogin" type="button" role="tab">登录</button>
+      <button class="auth-tab" id="tabRegister" type="button" role="tab">注册</button>
+    </div>
+
+    <form class="modal-body auth-body" id="authForm" autocomplete="on">
+      <label class="field">
+        <span class="field-label">用户名</span>
+        <input id="authUser" name="username" type="text" autocomplete="username"
+               placeholder="字母、数字、下划线或连字符，3–32 位" required />
+      </label>
+      <label class="field">
+        <span class="field-label">密码</span>
+        <input id="authPass" name="password" type="password" autocomplete="current-password"
+               placeholder="至少 8 位" required />
+      </label>
+      <p class="auth-hint" id="authHint">注册即表示你同意合理使用；额度按账号计算。</p>
+      <p class="auth-error" id="authError" hidden></p>
+    </form>
+
+    <footer class="modal-foot">
+      <div class="modal-note"><i data-icon="info"></i><span id="authNote">游客额度每天约 2 万 token</span></div>
+      <button class="modal-primary" id="authGo" type="submit" form="authForm"><i data-icon="rocket"></i><span id="authGoLabel">登录</span></button>
     </footer>
   </div>
 </div>

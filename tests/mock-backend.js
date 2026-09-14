@@ -92,11 +92,22 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/identity') return json(res, 200, MOCK_IDENTITY);
 
-    /* 额度：后端真实实现按签名身份计量 token，这里只回一个固定快照，
-       让前端的「今日额度」进度条有数据可渲染。 */
+    /* 账号：mock 里始终是游客——前端据此隐藏上传、显示"体验额度"。
+       要测登录后的界面，把 /api/auth/me 改成 {registered:true, tier:'member'} 即可。 */
+    if (u.pathname === '/api/auth/me') return json(res, 200, { registered: false, tier: 'guest', user: null });
+    if (u.pathname === '/api/auth/login' || u.pathname === '/api/auth/register') {
+      return json(res, 200, {
+        user: { user_id: MOCK_IDENTITY.user_id, username: 'mockuser' },
+        tier: 'member', registered: true
+      });
+    }
+    if (u.pathname === '/api/auth/logout') return json(res, 200, { ok: true, tier: 'guest', registered: false });
+
+    /* 额度：后端真实实现按签名身份 + 档位计量，这里只回固定快照，
+       让前端的额度条有数据可渲染。 */
     if (u.pathname === '/api/usage') return json(res, 200, {
-      day: '2026-01-01', tokens_used: 123456, tokens_budget: 2000000,
-      requests_today: 7, requests_per_min_limit: 8
+      day: '2026-01-01', tier: 'guest', tokens_used: 8000, tokens_budget: 20000,
+      requests_today: 3, requests_per_min_limit: 3, max_input_tokens: 200
     });
 
     if (u.pathname === '/api/threads' && req.method === 'GET') {

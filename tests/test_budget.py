@@ -78,10 +78,12 @@ def test_rate_limits() -> None:
           _raises(lambda: b2.check_preflight(org_id="a3", ip="9.9.9.9", message="x"), "ip_rate_limited"))
 
     # 窗口过期后恢复：把记录时间往前挪 61 秒
+    # 计数键现在带档位前缀（``tier:org``），不再直接是 org_id——取键要走 _key()。
     b3 = TokenBudget(per_user_rpm=1, per_ip_rpm=0, daily_token_budget=0, max_input_tokens=0)
     b3.check_preflight(org_id="ok", ip=None, message="x")
+    key = b3._key(b3._current_tier(), "ok")
     with b3._lock:
-        b3._usage["ok"].window = [t - 61 for t in b3._usage["ok"].window]
+        b3._usage[key].window = [t - 61 for t in b3._usage[key].window]
     b3.check_preflight(org_id="ok", ip=None, message="x")
     check("窗口滑出后恢复放行", True)
 
@@ -113,7 +115,7 @@ def test_daily_budget() -> None:
     check("快照反映真实用量", snap["tokens_used"] == 1000 and snap["tokens_budget"] == 1000, snap)
 
     # 按天重置：把 day 改成昨天，再取一次应该归零
-    b._usage["o1"].day = "2000-01-01"
+    b._usage[b._key(b._current_tier(), "o1")].day = "2000-01-01"
     b.check_preflight(org_id="o1", ip=None, message="hi")
     check("跨天自动归零（新的一天重新开始）", b.snapshot("o1")["tokens_used"] == 0)
 
@@ -175,7 +177,11 @@ def test_persistence() -> None:
 
     b.check_preflight(org_id="o1", ip=None, message="hi")
     b.add_tokens("o1", 42)
-    check("每次变更都会尝试落库", len(saved) >= 2 and saved[-1][0] == "o1", saved[-1] if saved else None)
+    # 计数键现在带档位前缀（``tier:org``）：同一 org 在两档下各记各的，
+    # 这样"游客额度"与"会员额度"不会互相污染。
+    check("每次变更都会尝试落库（键带档位前缀）",
+          len(saved) >= 2 and saved[-1][0].endswith(":o1"),
+          saved[-1] if saved else None)
 
     # 落库失败不能影响对话
     b2 = TokenBudget(per_user_rpm=0, per_ip_rpm=0, daily_token_budget=5000, max_input_tokens=0)
@@ -236,7 +242,11 @@ def test_http_429() -> None:
         r2 = send(client_a)
         check("第二次立刻被限流 → 429", r2.status_code == 429, r2.status_code)
         check("429 带 Retry-After", r2.headers.get("retry-after") is not None, r2.headers.get("retry-after"))
-        check("429 的 detail 是给人看的中文", "频繁" in r2.json().get("detail", ""), r2.json().get("detail"))
+        detail2 = r2.json().get("detail", "")
+        check("429 的 detail 是给人看的中文", "频繁" in detail2 or "受限" in detail2, detail2)
+        # TestClient 没带会话 cookie，所以走的是游客档——文案必须引导注册。
+        # 这条断言把「游客体验不好就直接流失」这个产品要求钉住。
+        check("游客被限流时的文案引导注册", "注册" in detail2, detail2)
 
         # 换个身份：额度互相独立
         client_b = TestClient(app)
@@ -253,9 +263,10 @@ def test_http_429() -> None:
         budget.per_user_rpm = 100
         budget.max_input_tokens = 50
         r4 = send(client_a, message="字" * 400)
+        detail4 = r4.json().get("detail", "")
         check("超长消息被拒（拿不到额度就烧不了钱）",
-              r4.status_code == 429 and "过长" in r4.json().get("detail", ""),
-              r4.json().get("detail"))
+              r4.status_code == 429 and ("过长" in detail4 or "受限" in detail4),
+              detail4)
     finally:
         budget.per_user_rpm, budget.per_ip_rpm = old_user_rpm, old_ip_rpm
         budget.max_input_tokens = old_max_input

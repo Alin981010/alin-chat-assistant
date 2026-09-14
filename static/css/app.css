@@ -11,6 +11,12 @@
      Space Grotesk (labels / data).
    ============================================================ */
 
+/* 规范规则：`hidden` 属性必须真的不显示。
+   浏览器默认样式里 `[hidden]{display:none}` 的优先级低于任何类选择器，
+   而 .modal-overlay 是 display:grid —— 于是带 hidden 的弹窗仍然铺满屏幕
+   （只是 opacity:0 看不见），会拦截整页点击。这条把它钉死。 */
+[hidden]{ display:none !important; }
+
 :root{
   /* --- paper --- */
   --bg:        #EFE2C8;   /* page mat        */
@@ -378,6 +384,29 @@ button:focus-visible, textarea:focus-visible, a:focus-visible{
 .rail-foot .ver{ font-family:var(--font-mono); font-size:10px; color:var(--ink-4); letter-spacing:.06em; }
 .rail-foot .sync{ display:flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:10px; color:var(--ink-3); }
 
+/* ---------- 账号条 ---------- */
+.rail-account{ display:flex; align-items:center; gap:6px; padding:6px 4px 0; }
+.rail-account .acct-btn{
+  flex:1; display:flex; align-items:center; gap:7px; min-width:0;
+  padding:7px 10px; border:1px solid color-mix(in srgb, var(--ink-4) 30%, transparent);
+  border-radius:7px; background:transparent; cursor:pointer;
+  font-family:var(--font-mono); font-size:11px; color:var(--ink-2);
+  letter-spacing:.03em; text-align:left; transition:background .15s, border-color .15s;
+}
+.rail-account .acct-btn:hover{ background:color-mix(in srgb, var(--ink-4) 10%, transparent); }
+.rail-account .acct-btn.is-member{ border-color:var(--accent); color:var(--accent); }
+.rail-account .acct-btn svg{ flex:0 0 auto; }
+.rail-account .acct-out{
+  flex:0 0 auto; padding:7px 9px; border-radius:7px; cursor:pointer;
+  border:1px solid color-mix(in srgb, var(--ink-4) 30%, transparent);
+  background:transparent; color:var(--ink-3); font-family:var(--font-mono); font-size:10px;
+}
+.rail-account .acct-out:hover{ color:var(--red-2); border-color:var(--red-2); }
+.rail-account .acct-out[hidden]{ display:none; }
+
+/* 游客：上传入口锁住 */
+.attach-add.is-locked{ opacity:.45; cursor:not-allowed; }
+
 /* 今日额度条：贴在 rail-foot 下方。默认隐藏，后端说「不限」时不占位。 */
 .rail-quota{
   display:grid; grid-template-columns:auto auto; align-items:center; gap:4px 8px;
@@ -397,6 +426,42 @@ button:focus-visible, textarea:focus-visible, a:focus-visible{
 /* 余量告急：只换颜色，不闪烁——侧栏常驻，动效会变成噪音。 */
 .rail-quota.is-low{ color:var(--red-2); }
 .rail-quota.is-low .q-fill{ background:var(--red); }
+/* 游客档额度很小，用虚线轨道 + 文字后缀做视觉区分，避免被误读成"怎么这么快就用完" */
+.rail-quota.is-guest .q-track{
+  background:transparent;
+  border:1px dashed color-mix(in srgb, var(--ink-4) 50%, transparent);
+}
+.rail-quota.is-guest .q-label::after{ content:' · 游客'; }
+
+/* ---------- 账号弹窗 ---------- */
+.modal-auth{ max-width:420px; }
+.auth-tabs{
+  display:flex; border-bottom:1px solid color-mix(in srgb, var(--ink-4) 22%, transparent);
+  padding:0 22px;
+}
+.auth-tab{
+  flex:1; padding:10px 0; border:0; background:transparent; cursor:pointer;
+  font-family:var(--font-mono); font-size:12px; letter-spacing:.06em; color:var(--ink-4);
+  border-bottom:2px solid transparent; margin-bottom:-1px;
+}
+.auth-tab.is-on{ color:var(--accent); border-bottom-color:var(--accent); }
+.auth-body{ display:flex; flex-direction:column; gap:14px; }
+.auth-body .field{ display:flex; flex-direction:column; gap:6px; }
+.auth-body .field-label{ font-family:var(--font-mono); font-size:10px; color:var(--ink-4); letter-spacing:.06em; }
+.auth-body input{
+  padding:10px 12px; border-radius:7px; outline:none;
+  border:1px solid color-mix(in srgb, var(--ink-4) 32%, transparent);
+  background:color-mix(in srgb, var(--ink-4) 6%, transparent);
+  font-size:14px; color:var(--ink-1);
+}
+.auth-body input:focus{ border-color:var(--accent); }
+.auth-hint{ font-size:12px; color:var(--ink-4); margin:0; line-height:1.6; }
+.auth-error{
+  margin:0; padding:8px 10px; border-radius:6px; font-size:12px;
+  color:var(--red-2); background:color-mix(in srgb, var(--red) 12%, transparent);
+}
+.auth-error[hidden]{ display:none; }
+.modal-primary:disabled{ opacity:.5; cursor:not-allowed; }
 
 /* ============================================================
    MAIN

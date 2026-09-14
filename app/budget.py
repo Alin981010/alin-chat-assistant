@@ -74,8 +74,65 @@ class BudgetExceeded(Exception):
         self.code = code
 
 
+@dataclass(frozen=True)
+class QuotaSpec:
+    """一档额度。游客与会员各一份，由 ``app/limits.py`` 提供默认值。"""
+
+    tier: str
+    daily_token_budget: int
+    rpm_per_user: int
+    max_input_tokens: int
+
+    @property
+    def is_member(self) -> bool:
+        return self.tier == "member"
+
+
+def _quota_specs() -> Dict[str, QuotaSpec]:
+    """从配置构造两档额度。
+
+    每次调用都读配置（而不是缓存），这样测试改配置后立刻生效；
+    开销只是几次属性读取。
+    """
+    from .config import (
+        CHAT_DAILY_TOKEN_BUDGET,
+        CHAT_MAX_INPUT_TOKENS,
+        CHAT_RPM_PER_USER,
+        GUEST_DAILY_TOKEN_BUDGET,
+        GUEST_MAX_INPUT_TOKENS,
+        GUEST_RPM_PER_USER,
+    )
+
+    return {
+        "guest": QuotaSpec(
+            tier="guest",
+            daily_token_budget=GUEST_DAILY_TOKEN_BUDGET,
+            rpm_per_user=GUEST_RPM_PER_USER,
+            max_input_tokens=GUEST_MAX_INPUT_TOKENS,
+        ),
+        "member": QuotaSpec(
+            tier="member",
+            daily_token_budget=CHAT_DAILY_TOKEN_BUDGET,
+            rpm_per_user=CHAT_RPM_PER_USER,
+            max_input_tokens=CHAT_MAX_INPUT_TOKENS,
+        ),
+    }
+
+
+def quota_for(tier: Optional[str]) -> QuotaSpec:
+    """按档位取额度。**认不出的档位一律按游客**——失败要往严的方向倒。"""
+    specs = _quota_specs()
+    return specs["member"] if tier == "member" else specs["guest"]
+
+
 class TokenBudget:
-    """按身份 + IP 的窗口限流与每日 token 额度。
+    """按身份 + IP 的窗口限流与每日 token 额度，**按档位（游客/会员）分别计算**。
+
+    档位不是构造参数，而是**每个请求**从上下文里的签名身份取（``app/identity.py``
+    的 ``Identity.tier``）。这样同一个进程同时服务两种人，谁也不会花掉谁的额度。
+
+    计数 key 一律带档位前缀（``member:o123``），即使某个 org_id 恰好两档都出现，
+    也各记各的。
 
     线程安全：所有读改写都持有同一把锁。计数很轻（一次请求几条记录），
     不值得为它引入更细的并发结构。
@@ -84,20 +141,60 @@ class TokenBudget:
     def __init__(
         self,
         *,
-        per_user_rpm: int = 8,
+        per_user_rpm: Optional[int] = None,
         per_ip_rpm: int = 30,
-        daily_token_budget: int = 2_000_000,
-        max_input_tokens: int = 60_000,
+        daily_token_budget: Optional[int] = None,
+        max_input_tokens: Optional[int] = None,
+        guest_daily_token_budget_per_ip: int = 60_000,
     ) -> None:
+        # 三个"每档不同"的限额默认是 None = **用该档在 app/limits.py 里的值**。
+        # 这一点很重要：如果这里给个具体默认值（比如 200 万），它会同时覆盖
+        # 游客档，把"游客额度大幅调低"这个需求悄悄抹平——实测踩过。
+        # 传具体值则等于全局覆盖（受限部署可以借它统一收紧；测试也用它）。
         self.per_user_rpm = per_user_rpm
         self.per_ip_rpm = per_ip_rpm
         self.daily_token_budget = daily_token_budget
         self.max_input_tokens = max_input_tokens
+        self.guest_daily_token_budget_per_ip = guest_daily_token_budget_per_ip
         self._lock = threading.Lock()
         self._usage: Dict[str, _DayUsage] = {}
         self._ip_hits: Dict[str, List[float]] = {}
-        #: 可选的落库回调，签名 (user_id, day, tokens, requests) -> None
+        #: 可选的落库回调，签名 (key, day, tokens, requests) -> None
         self._persist: Optional[Any] = None
+
+    # -- 档位 --------------------------------------------------------------
+
+    def spec_for(self, tier: Optional[str]) -> QuotaSpec:
+        """取某档的额度。实例属性为 ``None`` 时用该档自己的默认值。
+
+        于是"游客 2 万 / 会员 200 万"这个差别来自 ``app/limits.py``；
+        需要全局收紧（或测试里临时压额度）时，传一个具体值即可覆盖两档。
+        """
+        spec = quota_for(tier)
+        return QuotaSpec(
+            tier=spec.tier,
+            daily_token_budget=(
+                spec.daily_token_budget if self.daily_token_budget is None else self.daily_token_budget
+            ),
+            rpm_per_user=(
+                spec.rpm_per_user if self.per_user_rpm is None else self.per_user_rpm
+            ),
+            max_input_tokens=(
+                spec.max_input_tokens if self.max_input_tokens is None else self.max_input_tokens
+            ),
+        )
+
+    @staticmethod
+    def _key(tier: str, org_id: str) -> str:
+        return f"{tier}:{org_id}"
+
+    @staticmethod
+    def _current_tier() -> str:
+        """当前请求的档位。取不到身份时按游客算（宁可少给，不可多给）。"""
+        from .identity import get_current_identity
+
+        identity = get_current_identity()
+        return identity.tier if identity is not None else "guest"
 
     # -- 落库（可选） ------------------------------------------------------
 
@@ -118,7 +215,11 @@ class TokenBudget:
             logger.warning(f"用量落库失败（不影响本次限流）：{e}")
 
     def restore(self, org_id: str, day: Optional[str], tokens: Any, requests: Any) -> bool:
-        """从持久化记录恢复某 org 当天的用量；不是今天的记录直接丢弃。
+        """从持久化记录恢复某身份当天的用量；不是今天的记录直接丢弃。
+
+        key 与 ``check_preflight`` 一致（带档位前缀）。落库时写入的也是这个 key
+        （见 ``app/routes.py`` 的 persist 回调），两边必须对齐，否则重启后
+        "恢复了但没生效"。
 
         返回是否真的恢复了（调用方据此打日志）。恢复时**不带窗口**——重启前的
         "这一分钟问了几次"没有保留价值，带上反而会让用户重启后莫名被限。
@@ -131,8 +232,9 @@ class TokenBudget:
         except (TypeError, ValueError):
             return False
 
+        key = self._key(self._current_tier(), org_id)
         with self._lock:
-            self._usage[org_id] = _DayUsage(
+            self._usage[key] = _DayUsage(
                 day=day,
                 tokens=restored_tokens,
                 requests=restored_requests,
@@ -168,27 +270,57 @@ class TokenBudget:
     ) -> int:
         """在开始调用模型之前做全部检查，返回本次输入的估算 token 数。
 
-        顺序刻意如此：先看额度（已被禁的人不必再刷窗口计数），再看频率，
+        顺序刻意如此：先看额度（已被用尽的访客不必再刷窗口计数），再看频率，
         最后看单次输入大小。任何一项不过就抛 ``BudgetExceeded``。
+
+        档位从当前请求的签名身份取；游客与会员各自一套额度、各自计数。
         """
+        tier = self._current_tier()
+        spec = self.spec_for(tier)
+        key = self._key(tier, org_id)
         estimated_input = estimate_tokens(message) + max(0, extra_chars) // 2
         now = time.time()
 
         with self._lock:
-            entry = self._entry(org_id)
+            entry = self._entry(key)
 
-            if self.daily_token_budget > 0 and entry.tokens >= self.daily_token_budget:
+            if spec.daily_token_budget > 0 and entry.tokens >= spec.daily_token_budget:
+                if spec.is_member:
+                    message_text = "今日额度已用完，请明天再来。"
+                else:
+                    # 游客撞额度是最值得好好说话的一次——他很可能正是目标用户。
+                    message_text = (
+                        "游客体验额度已用完。注册一个账号即可获得完整额度（每天 "
+                        f"{self._member_budget_hint()} tokens），并保留历史会话。"
+                    )
                 raise BudgetExceeded(
-                    "今日额度已用完，请明天再来。",
+                    message_text,
                     retry_after=self._seconds_until_tomorrow(now),
                     code="daily_budget_exhausted",
                 )
 
+            # 游客的每 IP 每日总量：按身份的额度清 cookie 就能重置，这一层不能。
+            if not spec.is_member and ip and self.guest_daily_token_budget_per_ip > 0:
+                ip_entry = self._entry(self._ip_token_key(ip))
+                if ip_entry.tokens >= self.guest_daily_token_budget_per_ip:
+                    raise BudgetExceeded(
+                        "当前网络今日的游客额度已用完。注册账号即可继续使用。",
+                        retry_after=self._seconds_until_tomorrow(now),
+                        code="guest_ip_budget_exhausted",
+                    )
+
             self._prune_window(entry.window, now)
-            if self.per_user_rpm > 0 and len(entry.window) >= self.per_user_rpm:
+            if spec.rpm_per_user > 0 and len(entry.window) >= spec.rpm_per_user:
                 retry_after = int(entry.window[0] + 60.0 - now) + 1
+                if spec.is_member:
+                    message_text = f"提问过于频繁，请 {max(1, retry_after)} 秒后再试。"
+                else:
+                    message_text = (
+                        f"游客提问频率受限，请 {max(1, retry_after)} 秒后再试；"
+                        "注册后每分钟可用次数更多。"
+                    )
                 raise BudgetExceeded(
-                    f"提问过于频繁，请 {max(1, retry_after)} 秒后再试。",
+                    message_text,
                     retry_after=retry_after,
                     code="user_rate_limited",
                 )
@@ -204,10 +336,19 @@ class TokenBudget:
                         code="ip_rate_limited",
                     )
 
-            if self.max_input_tokens > 0 and estimated_input > self.max_input_tokens:
+            if spec.max_input_tokens > 0 and estimated_input > spec.max_input_tokens:
+                if spec.is_member:
+                    message_text = (
+                        f"单次消息过长（约 {estimated_input} tokens，上限 {spec.max_input_tokens}）。"
+                        "请拆成几次提问，或改用上传文件的方式。"
+                    )
+                else:
+                    message_text = (
+                        f"游客单条消息字数受限（约 {estimated_input} tokens，上限 "
+                        f"{spec.max_input_tokens}）。注册后单条可发 6 万 tokens，并支持上传文件。"
+                    )
                 raise BudgetExceeded(
-                    f"单次消息过长（约 {estimated_input} tokens，上限 {self.max_input_tokens}）。"
-                    "请拆成几次提问，或改用上传文件的方式。",
+                    message_text,
                     retry_after=60,
                     code="input_too_large",
                 )
@@ -217,44 +358,77 @@ class TokenBudget:
             entry.requests += 1
             if ip:
                 self._ip_hits.setdefault(ip, []).append(now)
-            self._persist_safe(org_id, entry)
+            self._persist_safe(key, entry)
 
         return estimated_input
 
-    def add_tokens(self, org_id: str, tokens: int) -> int:
-        """累加真实用量，返回该身份今日累计 token。"""
+    def _member_budget_hint(self) -> str:
+        try:
+            return f"{quota_for('member').daily_token_budget:,}"
+        except Exception:  # noqa: BLE001
+            return "200,000"
+
+    @staticmethod
+    def _ip_token_key(ip: str) -> str:
+        """游客每 IP 每日总量的计数 key（与身份计数区分开）。"""
+        return f"guest_ip:{ip}"
+
+    def add_tokens(self, org_id: str, tokens: int, *, ip: Optional[str] = None) -> int:
+        """累加真实用量，返回该身份今日累计 token。
+
+        游客同时累加"每 IP 总量"，这样清 cookie 换身份也绕不过总量上限。
+        """
         if tokens <= 0:
             return 0
+        tier = self._current_tier()
+        key = self._key(tier, org_id)
         with self._lock:
-            entry = self._entry(org_id)
+            entry = self._entry(key)
             entry.tokens += int(tokens)
             total = entry.tokens
-            self._persist_safe(org_id, entry)
+            self._persist_safe(key, entry)
+
+            if tier != "member" and ip and self.guest_daily_token_budget_per_ip > 0:
+                ip_entry = self._entry(self._ip_token_key(ip))
+                ip_entry.tokens += int(tokens)
+                self._persist_safe(self._ip_token_key(ip), ip_entry)
         return total
 
-    def exceeded_midway(self, org_id: str) -> bool:
+    def exceeded_midway(self, org_id: str, *, ip: Optional[str] = None) -> bool:
         """流式过程中检查额度是否已耗尽（用于在下一轮模型调用前截断）。"""
-        if self.daily_token_budget <= 0:
+        tier = self._current_tier()
+        spec = self.spec_for(tier)
+        if spec.daily_token_budget <= 0:
             return False
+        key = self._key(tier, org_id)
         with self._lock:
-            entry = self._entry(org_id)
-            if entry.tokens < self.daily_token_budget:
+            entry = self._entry(key)
+            if entry.tokens < spec.daily_token_budget:
                 return False
             if not entry.warned:
                 entry.warned = True
-                logger.warning(f"org={org_id} 今日 token 额度已用尽，已中断本轮生成。")
+                logger.warning(f"{tier} org={org_id} 今日 token 额度已用尽，已中断本轮生成。")
             return True
 
     def snapshot(self, org_id: str) -> Dict[str, Any]:
-        """给接口/前端展示的用量快照。"""
+        """给接口/前端展示的用量快照（按当前请求的档位）。
+
+        前端靠 ``tier`` 决定是显示"游客体验额度"还是"今日额度"，
+        靠 ``tokens_budget`` 画进度条；两者都必须是服务端说了算。
+        """
+        tier = self._current_tier()
+        spec = self.spec_for(tier)
+        key = self._key(tier, org_id)
         with self._lock:
-            entry = self._entry(org_id)
+            entry = self._entry(key)
             return {
                 "day": entry.day,
+                "tier": spec.tier,
                 "tokens_used": entry.tokens,
-                "tokens_budget": self.daily_token_budget,
+                "tokens_budget": spec.daily_token_budget,
                 "requests_today": entry.requests,
-                "requests_per_min_limit": self.per_user_rpm,
+                "requests_per_min_limit": spec.rpm_per_user,
+                "max_input_tokens": spec.max_input_tokens,
             }
 
     @staticmethod
@@ -349,20 +523,28 @@ def get_budget() -> TokenBudget:
                     CHAT_MAX_INPUT_TOKENS,
                     CHAT_RPM_PER_IP,
                     CHAT_RPM_PER_USER,
+                    GUEST_DAILY_TOKEN_BUDGET,
+                    GUEST_DAILY_TOKEN_BUDGET_PER_IP,
+                    GUEST_MAX_INPUT_TOKENS,
+                    GUEST_RPM_PER_USER,
                 )
                 from .limits import AGENT_MAX_OUTPUT_TOKENS, AGENT_RECURSION_LIMIT
 
+                # **不要**把 CHAT_*（会员档）传给构造函数：那三个参数是"覆盖两档"
+                # 的语义，传进去会把游客档也一起改成会员值——"游客额度大幅调低"
+                # 就静默失效了。实测在线上踩到：游客的 /api/usage 显示 200 万/天。
+                # 每档的额度由 quota_for() 从 limits/config 取，这里只传全局项。
                 _budget = TokenBudget(
-                    per_user_rpm=CHAT_RPM_PER_USER,
                     per_ip_rpm=CHAT_RPM_PER_IP,
-                    daily_token_budget=CHAT_DAILY_TOKEN_BUDGET,
-                    max_input_tokens=CHAT_MAX_INPUT_TOKENS,
+                    guest_daily_token_budget_per_ip=GUEST_DAILY_TOKEN_BUDGET_PER_IP,
                 )
                 logger.info(
                     "TokenBudget 已初始化："
-                    f"每用户 {CHAT_RPM_PER_USER} 次/分，每 IP {CHAT_RPM_PER_IP} 次/分，"
-                    f"每日 {CHAT_DAILY_TOKEN_BUDGET or '不限'} tokens，"
-                    f"单次输入上限 {CHAT_MAX_INPUT_TOKENS} tokens，"
+                    f"会员 {CHAT_DAILY_TOKEN_BUDGET:,} tokens/天、{CHAT_RPM_PER_USER} 次/分、"
+                    f"单条 {CHAT_MAX_INPUT_TOKENS:,} tokens；"
+                    f"游客 {GUEST_DAILY_TOKEN_BUDGET:,} tokens/天、{GUEST_RPM_PER_USER} 次/分、"
+                    f"单条 {GUEST_MAX_INPUT_TOKENS} tokens、"
+                    f"每 IP 游客总量 {GUEST_DAILY_TOKEN_BUDGET_PER_IP:,}；"
                     f"单次输出上限 {AGENT_MAX_OUTPUT_TOKENS} tokens，"
                     f"agent 轮次上限 {AGENT_RECURSION_LIMIT}"
                 )

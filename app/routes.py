@@ -8,13 +8,20 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
 
 from .agent_setup import _ensure_user_habits
+from .auth import (
+    AuthError,
+    SESSION_COOKIE_NAME,
+    get_user_store,
+    issue_session,
+    session_cookie_kwargs,
+)
 from .budget import (
     BudgetExceeded,
     TokenBudget,
@@ -32,9 +39,12 @@ from .config import (
 )
 from .context_type import MemoryContext
 from .identity import (
+    Identity,
     get_current_identity,
+    get_current_user,
     is_legacy_org,
     is_valid_id,
+    new_id,
 )
 from .models import (
     MessageItem, ChatHistoryResponse, ThreadInfo,
@@ -251,6 +261,13 @@ def set_globals(store: PostgresStore, checkpointer: PostgresSaver, agent: Any):
         _attach_budget_store(store)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"用量计数落库未启用（仅内存限流，重启会清零）：{e}")
+
+    # 用户账号同样落在 PostgresStore：重启后账号必须还在，否则重启等于清空注册。
+    try:
+        loaded = get_user_store().attach(store)
+        logger.info(f"用户系统已就绪（载入 {loaded} 个账号）。")
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"用户系统初始化失败，账号将只在内存中有效：{e}", exc_info=True)
 
 
 BUDGET_NAMESPACE = ("usage_budget",)
@@ -811,6 +828,7 @@ def _stream_sse(
     user_id: str,
     org_id: str,
     file_id: Optional[str] = None,
+    client_ip_addr: Optional[str] = None,
 ) -> Iterator[str]:
     """同步生成器：直接调用 DeepAgents/LangGraph 原生的 graph.stream()，
     逐个产出 SSE 事件字符串。由 Starlette StreamingResponse 在线程池中迭代。
@@ -818,6 +836,9 @@ def _stream_sse(
     token 记账在这里做：每次模型调用后累加 ``usage_metadata``，并在**下一轮
     模型调用之前**检查当日额度是否已耗尽——一轮问答里 agent 可能调用模型
     很多次（工具循环），只在一头一尾检查的话，中间能烧掉的量无法预估。
+
+    ``client_ip_addr`` 只为游客的"每 IP 每日总量"记账用：按身份的额度清 cookie
+    就能重置，按 IP 那层不能。
     """
     reasoning_parts: List[str] = []
     content_parts: List[str] = []
@@ -883,7 +904,7 @@ def _stream_sse(
             # 每轮都先记账：usage 是累计值，用 max 保证单调
             reported = extract_tokens_from_chunk(chunk)
             if reported > tokens_at_last_call:
-                budget.add_tokens(org_id, reported - tokens_at_last_call)
+                budget.add_tokens(org_id, reported - tokens_at_last_call, ip=client_ip_addr)
                 tokens_at_last_call = reported
 
             if isinstance(chunk, ToolMessage):
@@ -913,7 +934,7 @@ def _stream_sse(
             # 额度用尽就停在这里，不再发起下一轮模型调用。
             # 已经吐出去的内容保留（用户看得到、也不重复计费），只是这一轮
             # 的答案会不完整——比放任它继续烧下去强。
-            if budget.exceeded_midway(org_id):
+            if budget.exceeded_midway(org_id, ip=client_ip_addr):
                 truncated_for_budget = True
                 break
     except Exception as e:
@@ -931,7 +952,7 @@ def _stream_sse(
     # 只靠真实值会让「不报用量的供应商」完全绕过额度。
     if tokens_at_last_call == 0:
         estimated = estimate_tokens("".join(content_parts)) + estimate_tokens("".join(reasoning_parts))
-        budget.add_tokens(org_id, estimated)
+        budget.add_tokens(org_id, estimated, ip=client_ip_addr)
         reported_tokens = estimated
     else:
         reported_tokens = tokens_at_last_call
@@ -987,11 +1008,27 @@ async def chat(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _require_member(feature: str) -> None:
+    """游客不能用的功能统一从这里拒。
+
+    为什么文件上传对游客关闭：文件解析走的是一次性大上下文，游客额度（2 万 token）
+    连一份中等 CSV 都读不完，放行只会得到"传了文件却分析不出来"的坏体验。
+    注册后立刻可用。
+    """
+    identity = get_current_identity()
+    if identity is None or not identity.is_member:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{feature}需要注册账号后使用。注册是免费的，还能保留历史会话。",
+        )
+
+
 @router.post("/files/upload", response_model=FileAnalysisResponse)
 async def upload_file(file: UploadFile = File(...), org_id: str = Form("")):
     if not _agent:
         raise HTTPException(status_code=500, detail="Agent not initialized")
     try:
+        _require_member("上传文件")
         org_id = _resolve_org(org_id or None)
         content = await file.read()
         file_id = f"file_{asyncio.get_event_loop().time():.0f}"
@@ -1074,7 +1111,7 @@ async def chat_stream(request: Request):
     # anyio 会把本任务的 contextvars 拷贝到每个工作线程，保证工具路由正确。
     _set_current_org(org_id)
     return StreamingResponse(
-        _stream_sse(message, thread_id, user_id, org_id),
+        _stream_sse(message, thread_id, user_id, org_id, client_ip_addr=client_ip(request)),
         media_type="text/event-stream",
         headers=_stream_headers(),
     )
@@ -1102,7 +1139,7 @@ async def chat_with_file_stream(request: Request):
     execution_org = _file_org_map.get(file_id, org_id) if file_id else org_id
     _set_current_org(execution_org)
     return StreamingResponse(
-        _stream_sse(message, thread_id, user_id, org_id, file_id),
+        _stream_sse(message, thread_id, user_id, org_id, file_id, client_ip(request)),
         media_type="text/event-stream",
         headers=_stream_headers(),
     )
@@ -1179,28 +1216,191 @@ async def sandbox_download(path: str, org_id: Optional[str] = None):
 
 @router.get("/identity")
 async def get_identity():
-    """把当前身份的 org_id / user_id 告诉前端。
+    """把当前身份的 org_id / user_id / 档位告诉前端。
 
     前端需要 org_id 来拼 thread_id（``org__user__后缀``）与沙箱下载链接，
-    而身份是服务端签发的，所以必须由服务端下发、前端原样回传，不能再由
-    浏览器自己造（旧实现写死 default-org，等于全网共用一个沙箱）。
+    而身份是服务端签发的，所以必须由服务端下发、前端原样回传。
+
+    ``tier`` / ``registered`` / ``username`` 决定前端显示「游客体验额度」还是
+    「今日额度」、以及要不要弹注册引导——**这些一律由服务端判定**。
     """
     identity = get_current_identity()
     if identity is None:
         raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
-    return {"org_id": identity.org_id, "user_id": identity.user_id}
+
+    user = get_current_user()
+    return {
+        "org_id": identity.org_id,
+        "user_id": identity.user_id,
+        "tier": identity.tier,
+        "registered": identity.is_member,
+        "username": user.username if user is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 账号：注册 / 登录 / 登出 / 当前状态
+# ---------------------------------------------------------------------------
+
+def _auth_payload(user, identity) -> Dict[str, Any]:
+    return {
+        "user": user.public(),
+        "tier": identity.tier,
+        "registered": identity.is_member,
+    }
+
+
+async def _read_json(request: Request) -> Dict[str, Any]:
+    body = await request.body()
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON。")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象。")
+    return data
+
+
+def _identity_cookie_kwargs() -> Dict[str, Any]:
+    from .identity import COOKIE_MAX_AGE, COOKIE_NAME, cookie_secure
+
+    return {
+        "key": COOKIE_NAME,
+        "httponly": False,
+        "samesite": "lax",
+        "secure": cookie_secure(),
+        "max_age": COOKIE_MAX_AGE,
+        "path": "/",
+    }
+
+
+def _attach_session(response, user, identity):
+    """写会话 cookie，并把身份 cookie 刷成新档位。
+
+    第二步不能省：身份 cookie 里存着 ``tier``，不刷新的话下一个请求读到的还是
+    guest——表现为"登录了但额度还是游客的"。
+    """
+    from .identity import issue_token
+
+    response.set_cookie(value=issue_session(user), **session_cookie_kwargs())
+    response.set_cookie(value=issue_token(identity), **_identity_cookie_kwargs())
+    return response
+
+
+def _upgrade_identity(user):
+    """把当前匿名身份升级成会员档，**沿用原 org**。
+
+    不换 org 的原因：正在看的会话其 thread_id 里嵌着 org，换掉等于把用户眼前的
+    历史全部作废。跨设备时 org 按 user_id 派生（``identity.member_identity``），
+    所以不同浏览器也能落到同一个命名空间。
+    """
+    from .identity import member_identity, set_current_identity
+
+    current = get_current_identity()
+    org_id = current.org_id if current is not None else None
+    identity = member_identity(user.user_id, org_id=org_id)
+    set_current_identity(identity)
+    return identity
+
+
+@router.post("/auth/register")
+async def auth_register(request: Request):
+    """注册并直接登录（省掉一次重复输入密码）。"""
+    data = await _read_json(request)
+    store = get_user_store()
+    try:
+        # pbkdf2 60 万次迭代约几十毫秒，放线程里跑，别卡住事件循环。
+        user = await asyncio.to_thread(
+            store.create, data.get("username", ""), data.get("password", "")
+        )
+    except AuthError as e:
+        status = 409 if e.code == "username_taken" else 400
+        logger.info(f"注册被拒：{e.code} username={data.get('username')!r}")
+        raise HTTPException(status_code=status, detail=e.message)
+
+    identity = _upgrade_identity(user)
+    logger.info(f"注册并登录：{user.username}（{user.user_id}）")
+    response = JSONResponse(_auth_payload(user, identity), status_code=201)
+    return _attach_session(response, user, identity)
+
+
+@router.post("/auth/login")
+async def auth_login(request: Request):
+    data = await _read_json(request)
+    store = get_user_store()
+    try:
+        user = await asyncio.to_thread(
+            store.authenticate, data.get("username", ""), data.get("password", "")
+        )
+    except AuthError as e:
+        logger.info(f"登录失败：{e.code} username={data.get('username')!r}")
+        raise HTTPException(status_code=401, detail=e.message)
+
+    identity = _upgrade_identity(user)
+    logger.info(f"登录成功：{user.username}（{user.user_id}）")
+    response = JSONResponse(_auth_payload(user, identity))
+    return _attach_session(response, user, identity)
+
+
+@router.post("/auth/logout")
+async def auth_logout():
+    """登出：清会话 cookie，并把身份 cookie 降回游客档。
+
+    **必须同时降级身份 cookie**：它里面存着 ``tier``，只删会话 cookie 的话，
+    下一个请求读到的还是 ``tier=member``——用户清掉会话 cookie 就能无限期
+    白拿会员额度。这是实测踩到的洞，别省这一步。
+
+    延续原 org：登出后浏览器看到的还是同一批会话（属于当前匿名身份的那些），
+    只是账号绑定的历史读不到了——这是"历史绑账号"的必然结果。
+    """
+    from .identity import (
+        COOKIE_MAX_AGE,
+        COOKIE_NAME,
+        cookie_secure,
+        get_current_identity,
+        issue_token,
+    )
+
+    response = JSONResponse({"ok": True, "tier": "guest", "registered": False})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+
+    current = get_current_identity()
+    guest = Identity(
+        org_id=current.org_id if current is not None else new_id("o"),
+        user_id=current.user_id if current is not None else new_id("u"),
+        tier="guest",
+    )
+    response.set_cookie(
+        value=issue_token(guest),
+        key=COOKIE_NAME,
+        httponly=False,
+        samesite="lax",
+        secure=cookie_secure(),
+        max_age=COOKIE_MAX_AGE,
+        path="/",
+    )
+    return response
+
+
+@router.get("/auth/me")
+async def auth_me():
+    """当前登录状态（前端启动时决定显示"登录"还是用户名）。"""
+    identity = get_current_identity()
+    if identity is None:
+        raise HTTPException(status_code=500, detail="身份未初始化，请检查服务端中间件配置。")
+    user = get_current_user()
+    if user is None:
+        return {"registered": False, "tier": identity.tier, "user": None}
+    return _auth_payload(user, identity)
 
 
 @router.get("/config")
 async def get_runtime_config():
-    """前端需要的运行时开关。
-
-    目前只有一个 ``code_execution``：关闭时前端要隐藏「沙箱」状态与相关文案，
-    否则用户会看到「沙箱未启动」而以为是故障——实际是本部署不提供代码执行。
-    """
+    """前端需要的运行时开关。"""
     return {
         "code_execution": ENABLE_CODE_EXECUTION,
         "assistant_name": ASSISTANT_NAME,
+        "accounts_enabled": True,
     }
 
 

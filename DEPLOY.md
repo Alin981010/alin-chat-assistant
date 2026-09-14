@@ -137,6 +137,28 @@ curl -s -i localhost:8088/api/config -H "Origin: https://evil.example.com" \
 curl -s localhost:8088/health
 ```
 
+### 部署后必查：两档额度是否真的不同
+
+这一条单独列出来，因为**它曾经静默失效过**：`TokenBudget` 的三个"每档不同"的参数
+如果被传了具体值（例如把会员档的 `CHAT_*` 当构造参数），会同时覆盖游客档，
+游客就拿到了会员额度——而所有单元用例照样全绿。用下面两条命令一眼看穿：
+
+```bash
+CJ=/tmp/tier.txt; rm -f $CJ
+# 游客（不带会话 cookie）
+curl -s -c $CJ -b $CJ -o /dev/null localhost:8088/api/identity
+curl -s -c $CJ -b $CJ localhost:8088/api/usage     # 期望 tokens_budget=20000, rpm=3, max_input=200
+
+# 注册一个测试账号后
+curl -s -c $CJ -b $CJ -X POST localhost:8088/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"tiercheck","password":"test-password-123"}' -o /dev/null
+curl -s -c $CJ -b $CJ localhost:8088/api/usage     # 期望 tokens_budget=2000000, rpm=8, max_input=60000
+```
+
+**注意**：这么验完请在库里删掉 `tiercheck` 这个账号（或换个明显是测试的名字），
+别把测试账号留在正式环境里。
+
 > **`APP_COOKIE_SECURE` 只有上了 HTTPS 才能置 true**。置 true 后 cookie 仅在 HTTPS
 > 下发送，而现在用的是 `http://<IP>:8088` 明文访问，改了会导致身份无法保持。
 > 等反向代理加了 TLS、改用 https 访问之后，再同时改这一项。

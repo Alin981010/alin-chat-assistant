@@ -104,13 +104,27 @@ def reset_secret_cache() -> None:
 
 @dataclass(frozen=True)
 class Identity:
-    """一个已通过签名校验的匿名身份。"""
+    """一个已通过签名校验的匿名身份。
+
+    ``user_id`` 有两个来源：
+
+    - **游客**：服务端随机生成的 ``u…``，随 cookie 走，换浏览器就换身份；
+    - **已登录**：真实账号的 ``user_id``（见 ``app/auth.py`` 的 ``User.user_id``）。
+
+    ``tier`` 决定额度档位（见 ``app/budget.py``）：``guest`` 或 ``member``。
+    它由服务端在鉴权时判定，**不接受客户端声明**——否则谁都能自称会员。
+    """
 
     org_id: str
     user_id: str
+    tier: str = "guest"
+
+    @property
+    def is_member(self) -> bool:
+        return self.tier == "member"
 
     def __str__(self) -> str:  # pragma: no cover - 仅用于日志
-        return f"Identity(org={self.org_id[:8]}…, user={self.user_id[:8]}…)"
+        return f"Identity(org={self.org_id[:8]}…, user={self.user_id[:8]}…, tier={self.tier})"
 
 
 def is_valid_id(value: Optional[str]) -> bool:
@@ -124,8 +138,19 @@ def new_id(prefix: str) -> str:
 
 
 def new_identity() -> Identity:
-    """签发一个全新身份。"""
-    return Identity(org_id=new_id("o"), user_id=new_id("u"))
+    """签发一个全新**游客**身份。"""
+    return Identity(org_id=new_id("o"), user_id=new_id("u"), tier="guest")
+
+
+def member_identity(user_id: str, org_id: Optional[str] = None) -> Identity:
+    """构造一个**已登录**身份。
+
+    ``org_id`` 由调用方传入已有的匿名 org（这样同一浏览器登录前后共用一台沙箱，
+    老会话也不会因为登录而全变成"别人的"）；不传则按 user_id 派生一个稳定值，
+    保证同一账号在不同设备上拿到同一个沙箱命名空间。
+    """
+    return Identity(org_id=org_id or ("o" + user_id[1:]), user_id=user_id, tier="member")
+
 
 
 def _b64e(raw: bytes) -> str:
@@ -138,8 +163,17 @@ def _b64d(text: str) -> bytes:
 
 
 def issue_token(identity: Identity) -> str:
-    """为一个身份签发令牌。"""
-    payload = {"o": identity.org_id, "u": identity.user_id, "v": TOKEN_VERSION}
+    """为一个身份签发令牌。``t`` 是额度档位（guest/member）。
+
+    注意：**登录状态不写在这里**。这个 cookie 只表示"这台浏览器是谁"，
+    登录与否由 ``app/auth.py`` 的会话 cookie 决定——两件事分开，登出才能只清一个。
+    """
+    payload = {
+        "o": identity.org_id,
+        "u": identity.user_id,
+        "t": identity.tier,
+        "v": TOKEN_VERSION,
+    }
     body = _b64e(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     sig = _b64e(hmac.new(_secret(), body.encode("ascii"), hashlib.sha256).digest())
     return f"{body}.{sig}"
@@ -180,7 +214,12 @@ def verify_token(token: Optional[str]) -> Optional[Identity]:
     if not is_valid_id(org_id) or not is_valid_id(user_id):
         return None
 
-    return Identity(org_id=org_id, user_id=user_id)
+    # 档位只接受这两个值；cookie 里带了别的一律按游客处理（不报错、不提升权限）。
+    tier = payload.get("t")
+    if tier not in ("guest", "member"):
+        tier = "guest"
+
+    return Identity(org_id=org_id, user_id=user_id, tier=tier)
 
 
 def is_legacy_org(org_id: Optional[str]) -> bool:
@@ -205,6 +244,27 @@ _identity_var: contextvars.ContextVar[Optional[Identity]] = contextvars.ContextV
     "request_identity", default=None
 )
 
+#: 当前请求的登录用户（``app/auth.py`` 的 ``User``）。
+#: 单独一个 contextvar 而不是挂在 Identity 上：Identity 是**签名 cookie 的内容**，
+#: 而登录状态来自另一个 cookie，两者生命周期不同（登出只清后者）。
+_user_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "request_user", default=None
+)
+
+
+def set_current_user(user: Optional[Any]):
+    """设置当前请求的登录用户（中间件调用）。"""
+    return _user_var.set(user)
+
+
+def reset_current_user(token) -> None:
+    _user_var.reset(token)
+
+
+def get_current_user() -> Optional[Any]:
+    """取当前登录用户；游客为 ``None``。"""
+    return _user_var.get()
+
 
 def set_current_identity(identity: Optional[Identity]):
     """设置当前请求身份。"""
@@ -227,46 +287,80 @@ def _cookie_kwargs() -> dict:
     ``httponly=False``：前端要读 org_id 来拼 thread_id（``org__user__后缀``）
     和沙箱下载链接，所以这个 cookie 必须对 JS 可见。可读不等于可伪造——
     改坏了签名校验会失败，请求方只会被换成一个全新身份，拿不到别人的容器。
+
+    登录会话 cookie（``app/auth.py`` 的 ``SESSION_COOKIE_NAME``）则相反，
+    是 ``httponly=True``：前端不需要读它，也就没必要让脚本能碰到。
     """
-    secure = (os.getenv("APP_COOKIE_SECURE") or "").strip().lower() in {"1", "true", "yes", "on"}
     return {
         "key": COOKIE_NAME,
         "httponly": False,
         "samesite": "lax",
-        "secure": secure,
+        "secure": cookie_secure(),
         "max_age": COOKIE_MAX_AGE,
         "path": "/",
     }
 
 
-async def identity_middleware(request: Request, call_next):
-    """给每个请求挂上一个已校验的匿名身份。
+def cookie_secure() -> bool:
+    """cookie 是否只在 HTTPS 下发送。
 
-    优先级：
-
-    1. cookie 里有合法签名 → 用它；
-    2. 否则看请求头 ``X-Alin-Agent-Id``（给非浏览器客户端用，同样要签名）；
-    3. 都没有 / 签名不通过 → 视为新访客，现场签发，并在响应里 Set-Cookie。
-
-    注意这里**不拒绝**未签名请求：本中间件只保证「身份不可伪造」，
-    「这个身份能碰什么」由各路由自己按 org 归属判断。
+    注意：当前部署若是 ``http://<IP>:8088`` 明文访问，这里**必须**保持 false，
+    置 true 会让 cookie 根本发不出去（表现是"登录了但下一个请求又不认识我"）。
     """
-    identity = verify_token(request.cookies.get(COOKIE_NAME))
-    if identity is None:
-        identity = verify_token(request.headers.get("X-Alin-Agent-Id"))
+    return (os.getenv("APP_COOKIE_SECURE") or "").strip().lower() in {"1", "true", "yes", "on"}
 
-    issued = identity is None
-    if identity is None:
-        identity = new_identity()
+
+async def identity_middleware(request: Request, call_next):
+    """给每个请求挂上「你是谁 + 你是游客还是会员」。
+
+    三层优先级：
+
+    1. **登录会话 cookie**（``app/auth.py``）有效 → ``member`` 身份，
+       ``org_id`` 沿用浏览器原有的匿名 org（登录不该把沙箱和已建会话挪走）；
+    2. 否则用身份 cookie / ``X-Alin-Agent-Id`` 里的匿名身份 → ``guest``；
+    3. 都没有或签名不通过 → 视为新访客，现场签发并在响应里 Set-Cookie。
+
+    **档位由这里判定，不接受客户端声明**——请求里无论写什么都不会把自己变成会员。
+    同样地，本中间件不拒绝任何请求：它只回答"你是谁"，
+    "这个身份能做什么"由各路由与 ``app/budget.py`` 决定。
+    """
+    from .auth import SESSION_COOKIE_NAME, get_user_store, verify_session
+
+    cookie_identity = verify_token(request.cookies.get(COOKIE_NAME))
+    if cookie_identity is None:
+        cookie_identity = verify_token(request.headers.get("X-Alin-Agent-Id"))
+
+    # 登录状态：有效会话 cookie → 会员档，并沿用原来的 org
+    user = None
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_token:
+        try:
+            user = verify_session(session_token, get_user_store())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"会话校验异常（按未登录处理）：{e}")
+
+    issued = cookie_identity is None
+    if cookie_identity is None:
+        cookie_identity = new_identity()
+
+    if user is not None:
+        identity = member_identity(user.user_id, org_id=cookie_identity.org_id)
+    else:
+        identity = cookie_identity
 
     token = set_current_identity(identity)
+    user_token = set_current_user(user)
     request.state.identity = identity
+    request.state.user = user
     try:
         response = await call_next(request)
     finally:
+        reset_current_user(user_token)
         reset_current_identity(token)
 
-    if issued:
+    # 身份 cookie 变了就要重发：新访客要签发，登录/登出会改档位也要刷新，
+    # 否则 cookie 里还是旧档位，与内存里的身份不一致。
+    if issued or (cookie_identity != identity and user is not None):
         response.set_cookie(value=issue_token(identity), **_cookie_kwargs())
     return response
 

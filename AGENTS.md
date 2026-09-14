@@ -61,15 +61,30 @@
 - 改 `APP_SECRET_KEY` 会让**所有访客身份失效**（文件还在，但会换容器）。不配置时
   由 `DB_URI` 派生，所以**改数据库口令等价于换签名密钥**。
 
-### 9. token 消耗的四层防线（`app/budget.py` + `app/limits.py`）
-默认：每身份 8 次/分、每 IP 30 次/分、每身份每天 200 万 token、单次输入 6 万
-token、`max_tokens` 4096、`recursion_limit` 40。全都可以用环境变量覆盖。
-- 用量写进 Postgres 的 `usage_budget` 命名空间，**重启不清零**；要手动解除限制
-  就删对应 key（`/usage_<org>.json`）并重启。
-- `recursion_limit` 必须显式设：DeepAgents 默认 9999，等于不设限。
-- 按身份的额度以 cookie 为载体，**清 cookie 即可重置**；兜底是 `CHAT_RPM_PER_IP`。
-- 回归用例：`python tests/test_budget.py`（39 条）、`tests/test_isolation.py`（35 条）、
-  `tests/test_general_tools.py`（44 条）。
+### 9. token 消耗的防线与两档额度（`app/budget.py` + `app/limits.py`）
+
+**分游客与注册用户两档**，档位由签名身份决定（客户端声明无效）：
+
+| | 游客 | 注册用户 |
+|---|---|---|
+| 每天 token | 2 万 | 200 万 |
+| 每分钟次数 | 3 | 8 |
+| 单条上限 | 200 tokens | 6 万 tokens |
+| 上传文件 | 拒绝（403） | 允许 |
+| 每 IP 每天游客总量 | 6 万 | 不受此限 |
+
+全局另有：每 IP 30 次/分、`max_tokens` 4096、`recursion_limit` 40。
+
+- 计数键是 **`tier:org`**（如 `guest:o123`），两档各记各的账。改动 `_usage`
+  相关代码时别忘了这个前缀——测试里踩过。
+- `TokenBudget` 的三个"每档不同"的参数默认是 **None** = 用该档自己的默认值。
+  **千万别给具体默认值**（比如 200 万），那会同时盖掉游客档，"游客额度调低"
+  就悄悄失效了。
+- 用量写进 Postgres 的 `usage_budget`，**重启不清零**；账号在 `users` 命名空间。
+- 按身份的游客额度以 cookie 为载体，**清 cookie 即可重置**；真兜底是
+  `GUEST_DAILY_TOKEN_BUDGET_PER_IP`。
+- 回归用例：`python tests/test_auth.py`（74 条）、`tests/test_budget.py`（40 条）、
+  `tests/test_isolation.py`（38 条）、`tests/test_general_tools.py`（44 条）。
 
 ### 10. 定位是通用对话助手，代码默认不执行（2026-09 起）
 - `ENABLE_CODE_EXECUTION` 默认 **false**：agent 不挂 `execute`
@@ -96,6 +111,7 @@ token、`max_tokens` 4096、`recursion_limit` 40。全都可以用环境变量�
 仓库已加 `.gitattributes`（`* text=auto eol=lf`）锁住这件事。
 
 ### 12. 前端回归怎么跑（没有 headless Chrome 时）
+
 `tests/e2e.js` 需要 headless Chrome，受限环境里起不来（进程都不出现）。
 「过期会话自愈」这条路径由 `tests/test_stale_session.js` 覆盖：它用 Node 的 `vm`
 加载**真实的** `static/js/app.js`，只把 DOM 与 fetch 换成桩，验证
@@ -104,6 +120,24 @@ token、`max_tokens` 4096、`recursion_limit` 40。全都可以用环境变量�
 `app.js` 结尾会立即调 `boot()`（async），断言前要让微任务跑完（见该文件里的
 `runAppSettled`）——否则测到的是"还没开始"。
 
+
+### 13. 用户系统与账号（2026-09 起）
+- `app/auth.py`：用户名+密码注册登录，PBKDF2-HMAC-SHA256（60 万次迭代、每用户随机盐、
+  标准库实现不引 bcrypt）。存储格式 `pbkdf2_sha256$迭代$盐$摘要`，自描述。
+- **登录状态只认签名会话 cookie**（`HttpOnly`，30 天）。身份 cookie 里的 `tier`
+  只接受 `guest`/`member`，其他值降级游客；请求体里声明档位无效。
+- **登出必须同时把身份 cookie 降回 guest**：只删会话 cookie 的话，身份 cookie 里
+  还写着 `tier=member`，用户清掉会话 cookie 就能白拿会员额度（实测踩过，
+  `tests/test_auth.py` 有对应断言）。
+- 账号存在 PostgresStore 的 `users` 命名空间（`/u_<id>.json` + `/index.json` 索引），
+  启动时载入内存。**`/index.json` 丢了账号就读不出来**，别手工删它。
+- 用户不存在时也跑一次等价耗时的假校验，避免用响应时间探测账号是否存在。
+
+### 14. `[hidden]` 必须真的隐藏（CSS 坑）
+`.modal-overlay` 是 `display:grid`，会盖掉浏览器默认的 `[hidden]{display:none}`。
+结果：带 `hidden` 的弹窗其实仍铺满屏幕（只是 `opacity:0` 看不见），**拦截整页点击**。
+`app.css` 顶部加了 `[hidden]{display:none !important}` 把它钉死——加新弹窗时
+记得同时用 `hidden` 属性与 `.open` class（两者都控制显隐，缺一会出问题）。
 
 ---
 
